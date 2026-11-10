@@ -10,7 +10,7 @@
 
 param(
     [string]$UpdateUrl = "https://raw.githubusercontent.com/jjtjtyt6644/Cyberpunk-mod/main/dist/version.json",
-    [string]$LauncherVersion = "1.0.0",
+    [string]$LauncherVersion = "1.1.0",
     [string]$Lua = "",      # trainer file to bundle (default: ..\NightCityTrainer\init.lua)
     [string]$OutDir = ""    # output folder (default: ..\dist)
 )

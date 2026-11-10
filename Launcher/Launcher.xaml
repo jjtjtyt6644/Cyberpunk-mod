@@ -431,7 +431,7 @@
                             <Button x:Name="FolderButton" Grid.Column="0" Style="{StaticResource GhostButton}"
                                     Content="Change game folder"/>
                             <Button x:Name="RemoveButton" Grid.Column="2" Style="{StaticResource GhostButton}"
-                                    Content="Uninstall trainer"/>
+                                    Content="Uninstall"/>
                         </Grid>
                     </Grid>
                 </Grid>

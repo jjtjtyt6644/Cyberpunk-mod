@@ -385,6 +385,41 @@ namespace NightCityTrainer
             if (Directory.Exists(dir)) Directory.Delete(dir, true);
         }
 
+        // True when the player has other Cyber Engine Tweaks mods, which need CET to stay.
+        public static bool HasOtherCetMods(string game)
+        {
+            try
+            {
+                string mods = IOPath.Combine(PluginDir(game), "cyber_engine_tweaks", "mods");
+                if (!Directory.Exists(mods)) return false;
+                foreach (string dir in Directory.GetDirectories(mods))
+                {
+                    if (!string.Equals(IOPath.GetFileName(dir), "NightCityTrainer",
+                        StringComparison.OrdinalIgnoreCase)) return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        // Removes exactly the files Cyber Engine Tweaks installs, leaving the game unmodded.
+        public static void UninstallCet(string game)
+        {
+            string bin = IOPath.Combine(game, "bin", "x64");
+            string cetDir = IOPath.Combine(PluginDir(game), "cyber_engine_tweaks");
+            if (Directory.Exists(cetDir)) Directory.Delete(cetDir, true);
+            foreach (string file in new[] {
+                IOPath.Combine(PluginDir(game), "cyber_engine_tweaks.asi"),
+                IOPath.Combine(bin, "version.dll"),
+                IOPath.Combine(bin, "global.ini") })
+            {
+                if (File.Exists(file)) File.Delete(file);
+            }
+            string plugins = PluginDir(game);
+            if (Directory.Exists(plugins) && Directory.GetFileSystemEntries(plugins).Length == 0)
+                Directory.Delete(plugins);
+        }
+
         public static void LaunchGame(GameInstall game)
         {
             if (game.Store == "Steam")
@@ -494,6 +529,12 @@ namespace NightCityTrainer
             Refresh();
 
             if (options.ContainsKey("install")) await InstallOrUpdate(false);
+            if (options.ContainsKey("uninstall-all") && game != null)
+            {
+                Core.UninstallTrainer(game.Path);
+                Core.UninstallCet(game.Path);
+                Refresh();
+            }
             if (options.ContainsKey("shot")) await SaveScreenshot(options["shot"]);
             if (options.ContainsKey("status")) File.WriteAllText(options["status"], DescribeState());
             if (options.ContainsKey("exit")) window.Close();
@@ -747,17 +788,39 @@ namespace NightCityTrainer
         void Uninstall()
         {
             if (busy || game == null) return;
-            MessageBoxResult answer = MessageBox.Show(window,
-                "Remove the Night City Trainer from this game?\n\n"
-                + "Your trainer settings and saved teleport spots are deleted too. "
-                + "Cyber Engine Tweaks and your game saves are not touched.",
-                "Uninstall trainer", MessageBoxButton.OKCancel, MessageBoxImage.Question);
-            if (answer != MessageBoxResult.OK) return;
+            if (Core.IsGameRunning())
+            {
+                Fail("Close Cyberpunk 2077 first, then uninstall.");
+                return;
+            }
+
+            bool removeCet = false;
+            if (Core.CetInstalled(game.Path) && !Core.HasOtherCetMods(game.Path))
+            {
+                MessageBoxResult choice = MessageBox.Show(window,
+                    "Remove everything and go back to an unmodded game?\n\n"
+                    + "Yes  -  remove the trainer and Cyber Engine Tweaks\n"
+                    + "No  -  remove only the trainer\n\n"
+                    + "Trainer settings and saved teleport spots are deleted. Your game saves are not touched.",
+                    "Uninstall", MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
+                if (choice == MessageBoxResult.Cancel || choice == MessageBoxResult.None) return;
+                removeCet = choice == MessageBoxResult.Yes;
+            }
+            else
+            {
+                MessageBoxResult answer = MessageBox.Show(window,
+                    "Remove the Night City Trainer from this game?\n\n"
+                    + "Trainer settings and saved teleport spots are deleted. Cyber Engine Tweaks "
+                    + "stays because other mods use it. Your game saves are not touched.",
+                    "Uninstall trainer", MessageBoxButton.OKCancel, MessageBoxImage.Question);
+                if (answer != MessageBoxResult.OK) return;
+            }
             try
             {
                 Core.UninstallTrainer(game.Path);
+                if (removeCet) Core.UninstallCet(game.Path);
                 Refresh();
-                activity.Text = "Trainer removed.";
+                activity.Text = removeCet ? "Trainer and Cyber Engine Tweaks removed." : "Trainer removed.";
             }
             catch (Exception ex)
             {
@@ -882,7 +945,7 @@ namespace NightCityTrainer
         public static void Main(string[] args)
         {
             // Developer switches used for testing: --game <folder> --install --shot <png>
-            // --status <txt> --log <txt> --ignore-running --exit
+            // --status <txt> --log <txt> --ignore-running --uninstall-all --exit
             var options = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < args.Length; i++)
             {

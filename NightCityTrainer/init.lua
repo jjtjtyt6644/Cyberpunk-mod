@@ -3,9 +3,9 @@
 -- Open the CET overlay in game to show the menu.
 
 local NCT = {
-    version = "3.1.0",
+    version = "4.0.0",
     overlayOpen = false,
-    page = "Player",
+    page = "Home",
     tick = 0,
     infoTick = 0,
     slowTick = 0,
@@ -32,6 +32,7 @@ local NCT = {
     matQty = 500,
     blinkDistance = 10,
     flySpeed = 15,
+    xpMult = 1,
     rememberCheats = true,
     showPopups = true,
 
@@ -45,7 +46,7 @@ local NCT = {
 local SAVED_FIELDS = {
     "page", "speedMult", "jumpMult", "carryBonus", "cwCapacity", "gameSpeed", "hour", "moneyAmount",
     "level", "streetCred", "attrPoints", "perkPoints", "relicPoints", "attrValue", "itemId",
-    "itemQty", "matQty", "blinkDistance", "flySpeed", "rememberCheats", "showPopups",
+    "itemQty", "matQty", "blinkDistance", "flySpeed", "xpMult", "rememberCheats", "showPopups",
 }
 
 local REASON = "NightCityTrainer"
@@ -477,13 +478,83 @@ local function statCheat(key, statType, modType, value)
     end
 end
 
+-- Same, for cheats made of several stat changes: { { stat, modType, value }, ... }
+local function multiStatCheat(key, stats)
+    return function(on)
+        for i, entry in ipairs(stats) do
+            setStatMod(key .. i, gamedataStatType[entry[1]], gameStatModifierType[entry[2]],
+                on and entry[3] or nil)
+        end
+    end
+end
+
 local CHEATS = {
-    godMode = { label = "God Mode", remember = true, apply = setGodMode },
-    infStamina = { label = "Infinite Stamina", remember = true },
-    infOxygen = { label = "Infinite Oxygen", remember = true },
-    infRam = { label = "Infinite RAM", remember = true },
+    godMode = {
+        label = "God Mode", remember = true, apply = setGodMode,
+        desc = "You take no damage from anything.",
+    },
+    infStamina = {
+        label = "Infinite Stamina", remember = true,
+        desc = "Sprint, dodge and swing melee weapons without ever tiring.",
+    },
+    infOxygen = {
+        label = "Infinite Oxygen", remember = true,
+        desc = "Stay underwater as long as you like.",
+    },
+    infRam = {
+        label = "Infinite RAM", remember = true,
+        desc = "RAM refills instantly, so quickhacks are always available.",
+    },
+    regen = {
+        label = "Rapid Health Regen",
+        desc = "Health regenerates quickly, even in combat.",
+        apply = multiStatCheat("regen", {
+            { "HealthInCombatRegenEnabled", "Additive", 1 },
+            { "HealthGeneralRegenRateMult", "Additive", 10 },
+        }),
+    },
+    immune = {
+        label = "Status Immunity",
+        desc = "Immune to burning, poison, bleeding, shock and knockdown.",
+        apply = multiStatCheat("immune", {
+            { "BurningImmunity", "Additive", 1 },
+            { "PoisonImmunity", "Additive", 1 },
+            { "BleedingImmunity", "Additive", 1 },
+            { "ElectrocuteImmunity", "Additive", 1 },
+            { "KnockdownImmunity", "Additive", 1 },
+        }),
+    },
+    doubleJump = {
+        label = "Double Jump",
+        desc = "Jump again in mid-air, without needing the leg cyberware.",
+        apply = statCheat("doubleJump", "HasDoubleJump", "Additive", 1),
+    },
+    airDash = {
+        label = "Air Dash",
+        desc = "Dodge while in the air.",
+        apply = statCheat("airDash", "HasDodgeAir", "Additive", 1),
+    },
+    silent = {
+        label = "Silent Movement",
+        desc = "Running and landing make no noise for enemies to hear.",
+        apply = multiStatCheat("silent", {
+            { "CanRunSilently", "Additive", 1 },
+            { "CanLandSilently", "Additive", 1 },
+        }),
+    },
+    headshots = {
+        label = "Lethal Headshots",
+        desc = "Headshots deal massively increased damage.",
+        apply = statCheat("headshots", "HeadshotDamageMultiplier", "Additive", 10),
+    },
+    freezeClock = {
+        label = "Freeze Time Of Day",
+        desc = "The in-game clock stops, so it stays day or night.",
+        apply = function(on) Game.GetTimeSystem():SetPausedState(on, CName.new(REASON)) end,
+    },
     infAmmo = {
         label = "Infinite Ammo", remember = true,
+        desc = "Weapons stop using ammo and your reserve is kept topped up.",
         apply = function(on)
             local active = setInfiniteAmmoEffect(on)
             if on then
@@ -493,15 +564,37 @@ local CHEATS = {
             end
         end,
     },
-    noPolice = { label = "Disable Police", remember = true, apply = function(on) setPolice(not on) end },
-    noFall = { label = "No Fall Damage", apply = statCheat("noFall", "FallDamageReduction", "Additive", 100) },
-    alwaysCrit = { label = "Always Crit", apply = statCheat("alwaysCrit", "CritChance", "Additive", 100) },
-    megaCrit = { label = "Mega Crit Damage", apply = statCheat("megaCrit", "CritDamage", "Additive", 1000) },
-    tankArmor = { label = "Tank Armor", apply = statCheat("tankArmor", "Armor", "Additive", 10000) },
-    invisible = { label = "Invisible", apply = function(on) getPlayer():SetInvisible(on) end },
-    slowMo = { label = "Slow Motion", apply = function(on) setGameSpeed(on and 0.25 or 1.0) end },
+    noPolice = {
+        label = "Disable Police", remember = true, apply = function(on) setPolice(not on) end,
+        desc = "Crimes no longer raise a wanted level.",
+    },
+    noFall = {
+        label = "No Fall Damage", apply = statCheat("noFall", "FallDamageReduction", "Additive", 100),
+        desc = "Drop from any height without getting hurt.",
+    },
+    alwaysCrit = {
+        label = "Always Crit", apply = statCheat("alwaysCrit", "CritChance", "Additive", 100),
+        desc = "Every hit is a critical hit.",
+    },
+    megaCrit = {
+        label = "Mega Crit Damage", apply = statCheat("megaCrit", "CritDamage", "Additive", 1000),
+        desc = "Critical hits deal +1000% damage.",
+    },
+    tankArmor = {
+        label = "Tank Armor", apply = statCheat("tankArmor", "Armor", "Additive", 10000),
+        desc = "Adds 10,000 armor.",
+    },
+    invisible = {
+        label = "Invisible", apply = function(on) getPlayer():SetInvisible(on) end,
+        desc = "Enemies cannot see you.",
+    },
+    slowMo = {
+        label = "Slow Motion", apply = function(on) setGameSpeed(on and 0.25 or 1.0) end,
+        desc = "The world runs at quarter speed.",
+    },
     carGod = {
         label = "Indestructible Vehicle", remember = true,
+        desc = "The vehicle you drive takes no damage and repairs itself.",
         apply = function(on)
             if on then
                 protectVehicle()
@@ -513,6 +606,7 @@ local CHEATS = {
     },
     fly = {
         label = "Fly Mode",
+        desc = "Hover and fly through anything. Needs the Fly keys bound in CET.",
         apply = function(on)
             NCT.flyPos = nil
             if on then return "Fly Mode ON - hold your bound fly keys to move" end
@@ -566,7 +660,37 @@ local function everythingOff()
         NCT.gameSpeed = 1.0
         setGameSpeed(1.0)
     end)
+    pcall(function()
+        NCT.xpMult = 1
+        setStatMod("xpMult")
+    end)
     toast("Every cheat switched off", true)
+end
+
+-- One-click groups of cheats.
+local LOADOUTS = {
+    { "GOD", "Unkillable, with endless stamina, RAM and ammo.",
+        { "godMode", "infStamina", "infRam", "infAmmo", "noFall", "immune" } },
+    { "GHOST", "Unseen and unheard, with the police switched off.",
+        { "invisible", "silent", "noPolice" } },
+    { "PARKOUR", "Double jump, air dash, endless stamina, no fall damage.",
+        { "doubleJump", "airDash", "noFall", "infStamina" } },
+}
+
+local function applyLoadout(loadout)
+    local switched = 0
+    for _, key in ipairs(loadout[3]) do
+        local cheat = CHEATS[key]
+        if not NCT[key] then
+            local ok = true
+            if cheat.apply then ok = pcall(cheat.apply, true) end
+            if ok then
+                NCT[key] = true
+                switched = switched + 1
+            end
+        end
+    end
+    return loadout[1] .. " loadout on (" .. switched .. " cheats switched on)"
 end
 
 ---------------------------------------------------------------------------
@@ -795,10 +919,82 @@ local function toggle(label, value)
     return newValue, changed
 end
 
--- Checkbox for a cheat from the registry.
+-- Animated on/off switch, drawn by hand. Needs CET's draw-list functions; when
+-- those are missing the trainer falls back to plain checkboxes.
+local drawSupported = nil
+local switchAnim = {}
+
+local function canDraw()
+    if drawSupported == nil then
+        drawSupported = pcall(function()
+            local dl = ImGui.GetWindowDrawList()
+            local clear = ImGui.GetColorU32(0, 0, 0, 0)
+            local x, y = ImGui.GetCursorScreenPos()
+            ImGui.ImDrawListAddRectFilled(dl, x, y, x, y, clear, 0)
+            ImGui.ImDrawListAddCircleFilled(dl, x, y, 0, clear, 12)
+            ImGui.SetCursorScreenPos(x, y)
+            if type(x) ~= "number" or type(y) ~= "number" then error("no cursor position") end
+        end)
+    end
+    return drawSupported
+end
+
+local function mix(a, b, t)
+    return a + (b - a) * t
+end
+
+-- Returns newValue, changed, hovered.
+local function switch(id, label, value)
+    if not canDraw() then
+        local v, changed = toggle(label, value)
+        return v, changed, ImGui.IsItemHovered()
+    end
+
+    local h = em(1.2)
+    local w = h * 1.85
+    local x, y = ImGui.GetCursorScreenPos()
+    local pressed = ImGui.InvisibleButton("##switch_" .. id, availWidth(), h)
+    local hovered = ImGui.IsItemHovered()
+
+    local target = value and 1 or 0
+    local t = switchAnim[id] or target
+    t = t + (target - t) * 0.28
+    if math.abs(target - t) < 0.01 then t = target end
+    switchAnim[id] = t
+
+    local dl = ImGui.GetWindowDrawList()
+    local off = hovered and C.cyanD or C.panelHi
+    local track = ImGui.GetColorU32(mix(off[1], C.yellow[1], t), mix(off[2], C.yellow[2], t),
+        mix(off[3], C.yellow[3], t), 1)
+    local knob = ImGui.GetColorU32(mix(C.text[1], C.black[1], t), mix(C.text[2], C.black[2], t),
+        mix(C.text[3], C.black[3], t), 1)
+    ImGui.ImDrawListAddRectFilled(dl, x, y, x + w, y + h, track, h / 2)
+    ImGui.ImDrawListAddCircleFilled(dl, x + h / 2 + (w - h) * t, y + h / 2, h / 2 - 3, knob, 20)
+
+    ImGui.SetCursorScreenPos(x + w + em(0.6), y + (h - ImGui.GetFontSize()) / 2)
+    textColored(value and C.yellow or C.text, label)
+    ImGui.SetCursorScreenPos(x, y + h + GAP)
+    ImGui.Dummy(0, 0)
+
+    return (pressed and not value) or (not pressed and value), pressed, hovered
+end
+
+-- Switch for a cheat from the registry, with its description as a tooltip.
 local function cheatToggle(key, label)
-    local v, changed = toggle(label or CHEATS[key].label, NCT[key])
+    local cheat = CHEATS[key]
+    local v, changed, hovered = switch(key, label or cheat.label, NCT[key])
+    if hovered and cheat.desc then ImGui.SetTooltip(cheat.desc) end
     if changed then setCheat(key, v) end
+end
+
+-- Small boxed figure for the dashboard.
+local function statTile(id, label, value, width)
+    ImGui.PushStyleColor(ImGuiCol.ChildBg, C.panel[1], C.panel[2], C.panel[3], 1)
+    ImGui.BeginChild("##tile_" .. id, width, em(4.6), true, ImGuiWindowFlags.NoScrollbar)
+    textColored(C.dim, label)
+    textColored(C.yellow, value)
+    ImGui.EndChild()
+    ImGui.PopStyleColor(1)
 end
 
 -- Labelled controls. The label sits above the control; when `actionLabel` is
@@ -843,12 +1039,94 @@ end
 -- Pages
 ---------------------------------------------------------------------------
 
+local function refillAmmo()
+    for _, name in ipairs(AMMO) do giveItem(name, 999) end
+end
+
+local function drawHomePage()
+    local info = NCT.info or {}
+    local function shown(value, money)
+        if value == nil then return "--" end
+        return money and ("E$ " .. formatNumber(value)) or tostring(value)
+    end
+
+    local w = columnWidth(4)
+    statTile("level", "LEVEL", shown(info.level), w)
+    ImGui.SameLine()
+    statTile("cred", "STREET CRED", shown(info.cred), w)
+    ImGui.SameLine()
+    statTile("perk", "PERK POINTS", shown(info.perk), w)
+    ImGui.SameLine()
+    statTile("money", "EDDIES", shown(info.money, true), w)
+
+    section("Loadouts")
+    w = columnWidth(#LOADOUTS)
+    local hoveredLoadout
+    for i, loadout in ipairs(LOADOUTS) do
+        if primaryButton(loadout[1] .. "##loadout", w) then
+            run(loadout[1] .. " loadout", function() return applyLoadout(loadout) end)
+        end
+        if ImGui.IsItemHovered() then hoveredLoadout = loadout end
+        if i < #LOADOUTS then ImGui.SameLine() end
+    end
+    hint(hoveredLoadout and (hoveredLoadout[1] .. ": " .. hoveredLoadout[2])
+        or "One click switches on a whole set of cheats. Hover a loadout to see what it does.")
+
+    section("Quick Actions")
+    w = columnWidth(3)
+    if button("+ E$ 1,000,000", w) then
+        run("Added E$ 1,000,000", function() giveItem("Items.money", 1000000) end)
+    end
+    ImGui.SameLine()
+    if button("Heal To Full", w) then
+        run("Healed to full", function() fillPool(gamedataStatPoolType.Health) end)
+    end
+    ImGui.SameLine()
+    if button("Refill Ammo", w) then
+        run("Ammo refilled", refillAmmo)
+    end
+    if button("Kill Enemies Nearby", w) then
+        run("Kill enemies", function()
+            local n = killHostiles(30)
+            return n == 0 and "No hostile enemies within 30m" or ("Killed " .. n .. " hostile enemies")
+        end)
+    end
+    ImGui.SameLine()
+    if button("Clear Wanted Level", w) then
+        run("Wanted level cleared", clearWanted)
+    end
+    ImGui.SameLine()
+    if button("Repair Vehicle", w) then
+        run("Vehicle repaired", function() repairVehicle(requireVehicle()) end)
+    end
+
+    local active = {}
+    for key, cheat in pairs(CHEATS) do
+        if NCT[key] then active[#active + 1] = { key, cheat.label } end
+    end
+    table.sort(active, function(a, b) return a[2] < b[2] end)
+
+    section("Active Cheats  (" .. #active .. ")")
+    if #active == 0 then
+        hint("Nothing is switched on. Pick a loadout above or browse the pages on the left.")
+    else
+        for _, entry in ipairs(active) do
+            cheatToggle(entry[1])
+        end
+        if dangerButton("TURN EVERYTHING OFF", availWidth()) then
+            everythingOff()
+        end
+    end
+end
+
 local function drawPlayerPage()
     section("Survival")
     cheatToggle("godMode", "God Mode  (take no damage)")
     cheatToggle("infStamina")
     cheatToggle("infOxygen")
     cheatToggle("infRam", "Infinite RAM  (quickhacks)")
+    cheatToggle("regen")
+    cheatToggle("immune")
     cheatToggle("noFall")
 
     if primaryButton("RESTORE HEALTH, STAMINA AND RAM", availWidth()) then
@@ -858,6 +1136,11 @@ local function drawPlayerPage()
             pcall(fillPool, gamedataStatPoolType.Memory)
         end)
     end
+
+    section("Abilities")
+    cheatToggle("doubleJump")
+    cheatToggle("airDash")
+    cheatToggle("silent")
 
     section("Movement")
     NCT.speedMult = sliderFloat("speed", "Run speed", NCT.speedMult, 1.0, 5.0, "x%.1f")
@@ -911,6 +1194,7 @@ local function drawCombatPage()
     section("Damage")
     cheatToggle("alwaysCrit")
     cheatToggle("megaCrit", "Mega Crit Damage  (+1000%)")
+    cheatToggle("headshots")
 
     section("Defense")
     cheatToggle("tankArmor", "Tank Armor  (+10,000)")
@@ -1043,6 +1327,13 @@ local function drawProgressPage()
     hint("Relic points need the Phantom Liberty expansion.")
 
     section("Experience")
+    NCT.xpMult, apply = sliderInt("xpmult", "XP multiplier for everything you earn", NCT.xpMult, 1, 20, "SET")
+    if apply then
+        run("XP multiplier x" .. NCT.xpMult, function()
+            setStatMod("xpMult", gamedataStatType.XPbonusMultiplier, gameStatModifierType.Additive,
+                NCT.xpMult > 1 and (NCT.xpMult - 1) or nil)
+        end)
+    end
     local xw = columnWidth(2)
     if button("+10,000 XP", xw) then
         run("Gave 10,000 XP", function()
@@ -1224,6 +1515,7 @@ local function drawWorldPage()
     if apply then
         run(string.format("Time set to %02d:00", NCT.hour), function() setHour(NCT.hour) end)
     end
+    cheatToggle("freezeClock")
 
     NCT.gameSpeed, apply = sliderFloat("gspeed", "Game speed", NCT.gameSpeed, 0.1, 3.0, "x%.2f", "SET")
     if apply then
@@ -1256,6 +1548,15 @@ local function drawWorldPage()
     end
 
 end
+
+local HERO_VEHICLES = {
+    { "Rayfield Caliburn", "Vehicle.v_sport1_rayfield_caliburn_player" },
+    { "Rayfield Aerondight", "Vehicle.v_sport1_rayfield_aerondight_player" },
+    { "Quadra Type-66 Avenger", "Vehicle.v_sport2_quadra_type66_avenger_player" },
+    { "Porsche 911 Turbo", "Vehicle.v_sport2_porsche_911turbo_player" },
+    { "Yaiba Kusanagi (bike)", "Vehicle.v_sportbike1_yaiba_kusanagi_player" },
+    { "Jackie's Arch (bike)", "Vehicle.v_sportbike2_arch_jackie_player" },
+}
 
 local function drawVehiclesPage()
     section("Current Vehicle")
@@ -1297,6 +1598,21 @@ local function drawVehiclesPage()
     end
     hint("Boost uses the blink distance from the Teleport page. Fly Mode and saved spots also "
         .. "carry the vehicle you are driving.")
+
+    section("Dream Garage")
+    hint("Adds the vehicle to your owned list, ready to call from the vehicle menu.")
+    for i, car in ipairs(HERO_VEHICLES) do
+        if button(car[1] .. "##hero" .. i, w) then
+            run("Add " .. car[1], function()
+                if not TweakDB:GetRecord(TweakDBID.new(car[2])) then
+                    error(car[1] .. " does not exist on this game version")
+                end
+                Game.GetVehicleSystem():EnablePlayerVehicle(car[2], true, false)
+                return car[1] .. " added to your vehicles"
+            end)
+        end
+        if i % 2 == 1 and i < #HERO_VEHICLES then ImGui.SameLine() end
+    end
 
     section("Garage")
     if primaryButton("SUMMON MY VEHICLE", availWidth()) then
@@ -1440,18 +1756,26 @@ local function drawSettingsPage()
     end
 end
 
+-- name, draw function, icon name (from CET's bundled icon font)
 local PAGES = {
-    { "Player", drawPlayerPage },
-    { "Combat", drawCombatPage },
-    { "Money", drawMoneyPage },
-    { "Progress", drawProgressPage },
-    { "Items", drawItemsPage },
-    { "Vehicles", drawVehiclesPage },
-    { "World", drawWorldPage },
-    { "Teleport", drawTeleportPage },
-    { "Achievements", drawAchievementsPage },
-    { "Settings", drawSettingsPage },
+    { "Home", drawHomePage, "Home" },
+    { "Player", drawPlayerPage, "Account" },
+    { "Combat", drawCombatPage, "Sword" },
+    { "Money", drawMoneyPage, "Cash" },
+    { "Progress", drawProgressPage, "TrendingUp" },
+    { "Items", drawItemsPage, "PackageVariant" },
+    { "Vehicles", drawVehiclesPage, "Car" },
+    { "World", drawWorldPage, "Earth" },
+    { "Teleport", drawTeleportPage, "MapMarker" },
+    { "Achievements", drawAchievementsPage, "Trophy" },
+    { "Settings", drawSettingsPage, "Cog" },
 }
+
+local function pageIcon(name)
+    local ok, glyph = pcall(function() return IconGlyphs[name] end)
+    if ok and type(glyph) == "string" then return glyph .. "  " end
+    return ""
+end
 
 ---------------------------------------------------------------------------
 -- Window
@@ -1482,22 +1806,26 @@ end
 
 local function drawSidebar()
     local w = availWidth()
+    -- Left-aligned labels so the icons line up.
+    ImGui.PushStyleVar(ImGuiStyleVar.ButtonTextAlign, 0.08, 0.5)
     for _, page in ipairs(PAGES) do
         local name = page[1]
+        local label = pageIcon(page[3]) .. name .. "##nav"
         if NCT.page == name then
-            primaryButton(name .. "##nav", w)
-        elseif button(name .. "##nav", w) then
+            primaryButton(label, w)
+        elseif button(label, w) then
             NCT.page = name
         end
     end
     ImGui.Dummy(0, em(0.3))
-    if dangerButton("All Off##nav", w) then
+    if dangerButton(pageIcon("Power") .. "All Off##nav", w) then
         everythingOff()
     end
+    ImGui.PopStyleVar(1)
 end
 
 local function drawWindow()
-    ImGui.SetNextWindowSize(em(42), em(40), ImGuiCond.FirstUseEver)
+    ImGui.SetNextWindowSize(em(46), em(42), ImGuiCond.FirstUseEver)
     ImGui.SetNextWindowPos(80, 80, ImGuiCond.FirstUseEver)
 
     if ImGui.Begin("Night City Trainer", ImGuiWindowFlags.NoCollapse) then
@@ -1507,7 +1835,7 @@ local function drawWindow()
         local _, availH = ImGui.GetContentRegionAvail()
         local bodyH = math.max(availH - em(2.2), em(6))
 
-        ImGui.BeginChild("##nct_side", em(9.5), bodyH, true)
+        ImGui.BeginChild("##nct_side", em(11), bodyH, true)
         drawSidebar()
         ImGui.EndChild()
 
@@ -1526,7 +1854,7 @@ local function drawWindow()
                 end
             end
         end
-        if not found then NCT.page = "Player" end
+        if not found then NCT.page = "Home" end
         ImGui.EndChild()
         ImGui.PopStyleColor(1)
 
