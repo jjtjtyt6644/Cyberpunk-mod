@@ -10,7 +10,9 @@ using System.IO;
 using System.IO.Compression;
 using System.Net;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
@@ -182,6 +184,28 @@ namespace NightCityTrainer
             {
                 Directory.CreateDirectory(IOPath.GetDirectoryName(SettingsFile));
                 File.WriteAllText(SettingsFile, path);
+            }
+            catch { }
+        }
+
+        static string SkipSettingFile
+        {
+            get { return IOPath.Combine(IOPath.GetDirectoryName(SettingsFile), "auto-skip.txt"); }
+        }
+
+        // Whether PLAY should also start the skip helper. On unless switched off.
+        public static bool SkipHelperEnabled()
+        {
+            try { return !(File.Exists(SkipSettingFile) && File.ReadAllText(SkipSettingFile).Trim() == "0"); }
+            catch { return true; }
+        }
+
+        public static void SetSkipHelperEnabled(bool enabled)
+        {
+            try
+            {
+                Directory.CreateDirectory(IOPath.GetDirectoryName(SkipSettingFile));
+                File.WriteAllText(SkipSettingFile, enabled ? "1" : "0");
             }
             catch { }
         }
@@ -441,6 +465,230 @@ namespace NightCityTrainer
         }
     }
 
+    // Background helper that holds the skip key during cutscenes. Cyber Engine
+    // Tweaks cannot press keys, so the trainer reports "a scene is playing" in
+    // skip.flag and this process does the pressing. It runs only while the game
+    // runs, only presses while the game window is in front, and only while the
+    // trainer's Auto Skip switch is on.
+    public static class SkipHelper
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        struct MOUSEINPUT
+        {
+            public int dx, dy;
+            public uint mouseData, dwFlags, time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct KEYBDINPUT
+        {
+            public ushort wVk, wScan;
+            public uint dwFlags, time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Explicit)]
+        struct InputUnion
+        {
+            [FieldOffset(0)] public MOUSEINPUT mi;
+            [FieldOffset(0)] public KEYBDINPUT ki;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct INPUT
+        {
+            public uint type;
+            public InputUnion u;
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern uint SendInput(uint count, INPUT[] inputs, int size);
+
+        [DllImport("user32.dll")]
+        static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+        const uint KeyboardInput = 1;
+        const uint KeyUp = 0x0002;
+        const uint ScanCode = 0x0008;
+
+        // Hardware scan codes for the letter keys (set 1), so games that ignore
+        // virtual key codes still see the press.
+        static readonly Dictionary<char, ushort> Scan = new Dictionary<char, ushort>
+        {
+            { 'Q', 0x10 }, { 'W', 0x11 }, { 'E', 0x12 }, { 'R', 0x13 }, { 'T', 0x14 }, { 'Y', 0x15 },
+            { 'U', 0x16 }, { 'I', 0x17 }, { 'O', 0x18 }, { 'P', 0x19 }, { 'A', 0x1E }, { 'S', 0x1F },
+            { 'D', 0x20 }, { 'F', 0x21 }, { 'G', 0x22 }, { 'H', 0x23 }, { 'J', 0x24 }, { 'K', 0x25 },
+            { 'L', 0x26 }, { 'Z', 0x2C }, { 'X', 0x2D }, { 'C', 0x2E }, { 'V', 0x2F }, { 'B', 0x30 },
+            { 'N', 0x31 }, { 'M', 0x32 },
+        };
+
+        static string KeyFile
+        {
+            get { return IOPath.Combine(IOPath.GetDirectoryName(Core.SettingsFile), "skip-key.txt"); }
+        }
+
+        // The key to press: Y unless skip-key.txt next to the settings holds another letter.
+        public static char SkipKey()
+        {
+            try
+            {
+                if (File.Exists(KeyFile))
+                {
+                    string text = File.ReadAllText(KeyFile).Trim().ToUpperInvariant();
+                    if (text.Length == 1 && Scan.ContainsKey(text[0])) return text[0];
+                }
+            }
+            catch { }
+            return 'Y';
+        }
+
+        static void Send(char key, bool down, bool dryRun, string log)
+        {
+            if (dryRun)
+            {
+                Log(log, down ? "DOWN " + key : "UP " + key);
+                return;
+            }
+            var input = new INPUT[1];
+            input[0].type = KeyboardInput;
+            input[0].u.ki.wScan = Scan[key];
+            input[0].u.ki.dwFlags = ScanCode | (down ? 0u : KeyUp);
+            SendInput(1, input, Marshal.SizeOf(typeof(INPUT)));
+        }
+
+        static void Log(string file, string line)
+        {
+            if (file == null) return;
+            try { File.AppendAllText(file, line + Environment.NewLine); } catch { }
+        }
+
+        static bool GameInFront()
+        {
+            try
+            {
+                uint pid;
+                GetWindowThreadProcessId(GetForegroundWindow(), out pid);
+                if (pid == 0) return false;
+                using (Process p = Process.GetProcessById((int)pid))
+                {
+                    return string.Equals(p.ProcessName, "Cyberpunk2077", StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            catch { return false; }
+        }
+
+        // Is the trainer reporting a scene right now? The report must be fresh,
+        // otherwise a crashed game could leave the key held down.
+        static bool SceneReported(string flagFile)
+        {
+            try
+            {
+                if (!File.Exists(flagFile)) return false;
+                string[] parts = File.ReadAllText(flagFile).Trim().Split(' ');
+                long stamp;
+                if (parts.Length != 2 || !long.TryParse(parts[0], out stamp)) return false;
+                long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                return Math.Abs(now - stamp) <= 3 && parts[1] == "1";
+            }
+            catch { return false; }
+        }
+
+        public static void Run(string gameFolder, bool dryRun, bool ignoreFocus, int maxSeconds, string log)
+        {
+            bool created;
+            using (var mutex = new Mutex(true, dryRun ? "Local\\NightCityTrainerSkipHelperTest" : "Local\\NightCityTrainerSkipHelper", out created))
+            {
+                if (!created) return;
+
+                string modDir = Core.TrainerDir(gameFolder);
+                string flagFile = IOPath.Combine(modDir, "skip.flag");
+                string aliveFile = IOPath.Combine(modDir, "helper.alive");
+                char key = SkipKey();
+                bool held = false;
+                bool sawGame = false;
+                var clock = Stopwatch.StartNew();
+                var retap = Stopwatch.StartNew();
+                var heartbeat = Stopwatch.StartNew();
+                int missing = 0;
+
+                AppDomain.CurrentDomain.ProcessExit += delegate { if (held) Send(key, false, dryRun, log); };
+                Log(log, "START key=" + key);
+                try
+                {
+                    while (true)
+                    {
+                        if (maxSeconds > 0 && clock.Elapsed.TotalSeconds > maxSeconds) break;
+
+                        if (!dryRun)
+                        {
+                            if (Core.IsGameRunning()) { sawGame = true; missing = 0; }
+                            else
+                            {
+                                missing++;
+                                // Wait up to five minutes for the game to start, then quit once it closes.
+                                if (sawGame && missing > 50) break;
+                                if (!sawGame && missing > 3000) break;
+                            }
+                        }
+
+                        if (heartbeat.ElapsedMilliseconds >= 1000)
+                        {
+                            heartbeat.Restart();
+                            try
+                            {
+                                if (Directory.Exists(modDir))
+                                    File.WriteAllText(aliveFile, DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString());
+                            }
+                            catch { }
+                        }
+
+                        bool active = SceneReported(flagFile) && (ignoreFocus || GameInFront());
+                        if (active && !held)
+                        {
+                            Send(key, true, dryRun, log);
+                            held = true;
+                            retap.Restart();
+                        }
+                        else if (active && retap.ElapsedMilliseconds > 1500)
+                        {
+                            // Release and press again, so prompts that need a fresh press also work.
+                            Send(key, false, dryRun, log);
+                            Thread.Sleep(40);
+                            Send(key, true, dryRun, log);
+                            retap.Restart();
+                        }
+                        else if (!active && held)
+                        {
+                            Send(key, false, dryRun, log);
+                            held = false;
+                        }
+                        Thread.Sleep(100);
+                    }
+                }
+                finally
+                {
+                    if (held) Send(key, false, dryRun, log);
+                    try { if (File.Exists(aliveFile)) File.Delete(aliveFile); } catch { }
+                    Log(log, "STOP");
+                }
+            }
+        }
+
+        // Starts the helper as a hidden background process.
+        public static void Start(GameInstall game)
+        {
+            string exe = Assembly.GetExecutingAssembly().Location;
+            var info = new ProcessStartInfo(exe, "--skiphelper --game \"" + game.Path + "\"");
+            info.UseShellExecute = false;
+            info.CreateNoWindow = true;
+            Process.Start(info);
+        }
+    }
+
     public class LauncherWindow
     {
         enum Dot { Idle, Ok, Warn, Bad, Busy }
@@ -450,6 +698,7 @@ namespace NightCityTrainer
         readonly TextBlock activity, valGame, valCet, valTrainer, valUpdate, tip;
         readonly System.Windows.Shapes.Ellipse dotGame, dotCet, dotTrainer, dotUpdate;
         readonly Border progressTrack, progressFill;
+        readonly CheckBox skipCheck;
 
         readonly Dictionary<string, string> options;
         readonly Version bundledVersion;
@@ -487,6 +736,11 @@ namespace NightCityTrainer
             dotUpdate = Find<System.Windows.Shapes.Ellipse>("DotUpdate");
             progressTrack = Find<Border>("ProgressTrack");
             progressFill = Find<Border>("ProgressFill");
+            skipCheck = Find<CheckBox>("SkipCheck");
+            skipCheck.IsChecked = Core.SkipHelperEnabled();
+            skipCheck.Content = "Auto-skip cutscenes (presses " + SkipHelper.SkipKey() + " for you)";
+            skipCheck.Checked += delegate { Core.SetSkipHelperEnabled(true); };
+            skipCheck.Unchecked += delegate { Core.SetSkipHelperEnabled(false); };
 
             Find<TextBlock>("LauncherVersion").Text = "Launcher " + BuildInfo.LauncherVersion;
             Find<Grid>("TitleBar").MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
@@ -731,17 +985,26 @@ namespace NightCityTrainer
             }
         }
 
+        void StartSkipHelper()
+        {
+            if (game == null || skipCheck.IsChecked != true) return;
+            try { SkipHelper.Start(game); }
+            catch (Exception ex) { Log("Skip helper failed to start: " + ex.Message); }
+        }
+
         void Play()
         {
             if (game == null) return;
             if (Core.IsGameRunning())
             {
+                StartSkipHelper();
                 activity.Text = "Cyberpunk 2077 is already running.";
                 return;
             }
             try
             {
                 Core.LaunchGame(game);
+                StartSkipHelper();
                 activity.Text = "Starting Cyberpunk 2077...";
                 mainButton.IsEnabled = false;
                 var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(8) };
@@ -946,6 +1209,7 @@ namespace NightCityTrainer
         {
             // Developer switches used for testing: --game <folder> --install --shot <png>
             // --status <txt> --log <txt> --ignore-running --uninstall-all --exit
+            // Skip helper: --skiphelper --game <folder> [--dry-run --ignore-focus --max-seconds <n> --log <txt>]
             var options = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < args.Length; i++)
             {
@@ -953,6 +1217,22 @@ namespace NightCityTrainer
                 string key = args[i].Substring(2);
                 bool hasValue = i + 1 < args.Length && !args[i + 1].StartsWith("--");
                 options[key] = hasValue ? args[++i] : "";
+            }
+
+            // Hidden background mode: press the skip key during cutscenes, then exit with the game.
+            if (options.ContainsKey("skiphelper"))
+            {
+                string folder;
+                GameInstall found = null;
+                if (options.TryGetValue("game", out folder) && Core.IsGameFolder(folder)) found = Core.Describe(folder);
+                else found = Core.DetectGame();
+                if (found == null) return;
+                string seconds, log;
+                int maxSeconds = 0;
+                if (options.TryGetValue("max-seconds", out seconds)) int.TryParse(seconds, out maxSeconds);
+                options.TryGetValue("log", out log);
+                SkipHelper.Run(found.Path, options.ContainsKey("dry-run"), options.ContainsKey("ignore-focus"), maxSeconds, log);
+                return;
             }
 
             var app = new Application();

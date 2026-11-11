@@ -3,7 +3,7 @@
 -- Open the CET overlay in game to show the menu.
 
 local NCT = {
-    version = "4.2.0",
+    version = "4.3.0",
     overlayOpen = false,
     page = "Home",
     tick = 0,
@@ -224,6 +224,49 @@ end
 local function stopFastForward()
     local scenes = sceneInterface()
     if scenes:IsFastForwardingActive() then scenes:FastForwardingDeactivate() end
+end
+
+-- How cinematic the game currently is: 1 is normal play, 3 is a limited-control
+-- dialogue, 4 and 5 are cutscenes.
+local function sceneTier()
+    local defs = Game.GetAllBlackboardDefs()
+    local board = Game.GetBlackboardSystem():GetLocalInstanced(getPlayer():GetEntityID(), defs.PlayerStateMachine)
+    return board:GetInt(defs.PlayerStateMachine.SceneTier)
+end
+
+-- True while a cutscene or dialogue scene is playing.
+local function inScene()
+    local ok, tier = pcall(sceneTier)
+    if ok and type(tier) == "number" then return tier >= 3 end
+    local allowedOk, allowed = pcall(function()
+        return sceneInterface():IsFastForwardingAllowed(fastForwardMode())
+    end)
+    return allowedOk and allowed == true
+end
+
+-- The launcher's skip helper presses the skip key for us, because Cyber Engine
+-- Tweaks cannot press keys itself. It reads skip.flag from this folder, and
+-- writes helper.alive so the menu can tell whether it is running.
+local function writeSkipFlag(active)
+    pcall(function()
+        local file = io.open("skip.flag", "w")
+        if file then
+            file:write(os.time() .. " " .. (active and "1" or "0"))
+            file:close()
+        end
+    end)
+end
+
+local function skipHelperRunning()
+    local ok, text = pcall(function()
+        local file = io.open("helper.alive", "r")
+        if not file then return nil end
+        local content = file:read("*a")
+        file:close()
+        return content
+    end)
+    local stamp = ok and text and tonumber(text:match("%d+"))
+    return stamp ~= nil and stamp ~= false and math.abs(os.time() - stamp) <= 4
 end
 
 local AMMO = { "Ammo.HandgunAmmo", "Ammo.RifleAmmo", "Ammo.ShotgunAmmo", "Ammo.SniperRifleAmmo" }
@@ -648,13 +691,14 @@ local CHEATS = {
     },
     autoSkip = {
         label = "Auto Skip Cutscenes",
-        desc = "Fast-forwards cutscenes and dialogue the game lets you skip, as if holding the skip key.",
+        desc = "Presses your skip key (Y) for you during cutscenes and dialogue. Needs the launcher's skip helper.",
         apply = function(on)
-            -- Fail loudly now if this game version has no scene fast-forward.
-            sceneInterface()
-            fastForwardMode()
-            if on then return "Auto Skip ON - scenes the game allows skipping will fast-forward" end
-            stopFastForward()
+            if on then
+                if skipHelperRunning() then return "Auto Skip ON - the skip helper is running" end
+                return "Auto Skip ON - now start the skip helper with the launcher's PLAY button"
+            end
+            writeSkipFlag(false)
+            pcall(stopFastForward)
         end,
     },
     infAmmo = {
@@ -1687,9 +1731,17 @@ local function drawWorldPage()
     cheatToggle("freezeClock")
 
     section("Cutscenes")
-    cheatToggle("autoSkip")
-    hint("Works on scenes the game normally lets you fast-forward by holding a key. "
-        .. "Scenes it does not allow skipping still play.")
+    cheatToggle("autoSkip", "Auto Skip Cutscenes  (presses Y)")
+    if NCT.autoSkip then
+        if NCT.helperRunning then
+            textColored(C.green, "Skip helper is running.")
+        else
+            textColored(C.red, "Skip helper is NOT running. Press PLAY in the launcher to start it.")
+        end
+        textColored(C.dim, NCT.sceneActive and "A scene is playing right now." or "No scene is playing.")
+    end
+    hint("The launcher's skip helper presses Y whenever a cutscene or dialogue is playing. "
+        .. "It only presses while Cyberpunk 2077 is the active window, and only while this switch is on.")
 
     NCT.gameSpeed, apply = sliderFloat("gspeed", "Game speed", NCT.gameSpeed, 0.1, 3.0, "x%.2f", "SET")
     if apply then
@@ -2398,7 +2450,19 @@ registerForEvent("onUpdate", function(delta)
             NCT.hadPlayer = false
         end
 
-        if NCT.autoSkip and present then pcall(autoSkipScenes) end
+        if NCT.autoSkip and present then
+            pcall(autoSkipScenes)
+            local active = inScene()
+            NCT.sceneActive = active
+            -- Written on every change and once a second so the helper can tell we are alive.
+            if active ~= NCT.lastFlag or os.clock() - (NCT.flagTime or 0) >= 1 then
+                writeSkipFlag(active)
+                NCT.lastFlag, NCT.flagTime = active, os.clock()
+            end
+        elseif NCT.lastFlag ~= nil then
+            writeSkipFlag(false)
+            NCT.lastFlag, NCT.sceneActive = nil, nil
+        end
         if (NCT.infStamina or NCT.infOxygen or NCT.infRam) and getPlayer() then
             pcall(function()
                 if NCT.infStamina then fillPool(gamedataStatPoolType.Stamina) end
@@ -2410,7 +2474,10 @@ registerForEvent("onUpdate", function(delta)
 
     if NCT.infoTick >= 0.5 then
         NCT.infoTick = 0
-        if NCT.overlayOpen then refreshInfo() end
+        if NCT.overlayOpen then
+            refreshInfo()
+            NCT.helperRunning = skipHelperRunning()
+        end
     end
 
     if NCT.slowTick >= 2.0 then
