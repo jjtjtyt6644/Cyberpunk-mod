@@ -3,7 +3,7 @@
 -- Open the CET overlay in game to show the menu.
 
 local NCT = {
-    version = "4.7.0",
+    version = "4.8.0",
     overlayOpen = false,
     page = "Home",
     tick = 0,
@@ -1589,6 +1589,99 @@ end
 -- Pages
 ---------------------------------------------------------------------------
 
+-- Style and convenience helpers, used by the Home, World and Style pages.
+local function saveUserSettings()
+    pcall(function()
+        GetSingleton("inkMenuScenario"):GetSystemRequestsHandler():RequestSaveUserSettings()
+    end)
+end
+
+local function settingLabel(var)
+    local label = nil
+    pcall(function()
+        local text = Game.GetLocalizedTextByKey(var:GetDisplayName())
+        if type(text) == "string" and text ~= "" then label = text end
+    end)
+    if not label then
+        pcall(function()
+            local text = Game.GetLocalizedText(var:GetDisplayName().value)
+            if type(text) == "string" and text ~= "" then label = text end
+        end)
+    end
+    if not label then
+        pcall(function() label = var:GetName().value end)
+    end
+    return label or "Setting"
+end
+
+-- Every on/off option in a settings group, read fresh about once a second.
+local settingsCache = {}
+
+local function boolSettings(path)
+    local cached = settingsCache[path]
+    if cached and os.clock() - cached.time < 1 then return cached.list end
+    local list = {}
+    pcall(function()
+        local group = Game.GetSettingsSystem():GetGroup(path)
+        for _, var in ipairs(group:GetVars(false)) do
+            local ok, value = pcall(function() return var:GetValue() end)
+            if ok and type(value) == "boolean" then
+                list[#list + 1] = { var = var, label = settingLabel(var) }
+            end
+        end
+    end)
+    settingsCache[path] = { time = os.clock(), list = list }
+    return list
+end
+
+local function setBoolGroup(path, value)
+    local list = boolSettings(path)
+    if #list == 0 then error("the game has no settings under " .. path) end
+    for _, entry in ipairs(list) do pcall(function() entry.var:SetValue(value) end) end
+    settingsCache[path] = nil
+    saveUserSettings()
+end
+
+local function hudVisible()
+    for _, entry in ipairs(boolSettings("/interface/hud")) do
+        local ok, value = pcall(function() return entry.var:GetValue() end)
+        if ok and value then return true end
+    end
+    return false
+end
+
+local function toggleHud()
+    local show = not hudVisible()
+    setBoolGroup("/interface/hud", show)
+    return show and "HUD shown" or "HUD hidden"
+end
+
+local function quickSave()
+    GetSingleton("inkMenuScenario"):GetSystemRequestsHandler():QuickSave()
+    return "Quick save requested"
+end
+
+-- Moves the clock forward, for shops that are closed or quests that wait.
+local function skipHours(hours)
+    local timeSystem = Game.GetTimeSystem()
+    local now = timeSystem:GetGameTimeStamp()
+    timeSystem:SetGameTimeBySeconds(math.floor(now + hours * 3600))
+    return "Skipped " .. hours .. (hours == 1 and " hour" or " hours")
+end
+
+-- Removes burning, bleeding, poison, shock and every other debuff.
+local function cureDebuffs()
+    local player = getPlayer()
+    local cured = pcall(function() StatusEffectHelper.RemoveStatusEffectsWithTag(player, CName.new("Debuff"), 0) end)
+    if not cured then
+        cured = pcall(function()
+            StatusEffectHelper.RemoveStatusEffectsWithTag(GetGameInstance(), player:GetEntityID(), CName.new("Debuff"))
+        end)
+    end
+    if not cured then error("the game would not remove the effects") end
+    return "Every debuff removed"
+end
+
 local function refillAmmo()
     for _, name in ipairs(AMMO) do giveItem(name, 999) end
 end
@@ -1648,6 +1741,17 @@ local function drawHomePage()
     ImGui.SameLine()
     if button("Repair & Call Car", w) then
         run("Repair vehicle", reviveVehicle)
+    end
+    if button("Quick Save", w) then
+        run("Quick save", quickSave)
+    end
+    ImGui.SameLine()
+    if button("Cure All Debuffs", w) then
+        run("Cure debuffs", cureDebuffs)
+    end
+    ImGui.SameLine()
+    if button("Toggle HUD", w) then
+        run("Toggle HUD", toggleHud)
     end
 
     section("Profiles")
@@ -2416,6 +2520,14 @@ local function drawWorldPage()
         run(string.format("Time set to %02d:00", NCT.hour), function() setHour(NCT.hour) end)
     end
     cheatToggle("freezeClock")
+    textColored(C.dim, "Skip time")
+    local tw = columnWidth(4)
+    for i, hours in ipairs({ 1, 3, 6, 12 }) do
+        if button("+" .. hours .. "h##skiptime", tw) then
+            run("Skip time", function() return skipHours(hours) end)
+        end
+        if i < 4 then ImGui.SameLine() end
+    end
 
     section("Cutscenes")
     cheatToggle("autoSkip", "Auto Skip Cutscenes  (presses Y)")
@@ -2914,6 +3026,115 @@ local function drawShopPage()
     end
 end
 
+---------------------------------------------------------------------------
+-- Style and convenience
+-- The settings code follows the approach of psiberx's GameSettings module
+-- (cp2077-cet-kit, MIT licence): Game.GetSettingsSystem():GetGroup(path) and
+-- each var's GetValue / SetValue.
+---------------------------------------------------------------------------
+
+-- Adds a piece of clothing to the wardrobe without putting it in your inventory.
+local function addToWardrobe(name)
+    local id = ItemID.FromTDBID(TweakDBID.new(name))
+    local attempts = {
+        function() Game.GetWardrobeSystem():StoreUniqueItemIDAndMarkNew(id) end,
+        function() Game.GetWardrobeSystem():StoreUniqueItemID(id) end,
+        function() WardrobeSystem.StoreUniqueItemIDAndMarkNew(GetGameInstance(), id) end,
+        function() WardrobeSystem.SendWardrobeAddItemRequest(GetGameInstance(), id) end,
+    }
+    for _, attempt in ipairs(attempts) do
+        if pcall(attempt) then return true end
+    end
+    error("the wardrobe would not take " .. name)
+end
+
+local function unlockWardrobe()
+    if NCT.job then error("another job is still running") end
+    startShopBuild("Clothing", function(list)
+        local names = {}
+        for _, entry in ipairs(list) do names[#names + 1] = entry.id end
+        startJob("Wardrobe", names, addToWardrobe)
+    end)
+    return "Adding every outfit piece to your wardrobe..."
+end
+
+local HUD_PATH = "/interface/hud"
+local VISUAL_PATH = "/graphics/basic"
+
+local function drawSettingsGroup(path, idPrefix)
+    local list = boolSettings(path)
+    if #list == 0 then
+        hint("The game did not list these settings.")
+        return
+    end
+    for i, entry in ipairs(list) do
+        local ok, value = pcall(function() return entry.var:GetValue() end)
+        if ok then
+            local v, changed = switch(idPrefix .. i, entry.label, value)
+            if changed then
+                pcall(function() entry.var:SetValue(v) end)
+                settingsCache[path] = nil
+                saveUserSettings()
+            end
+        end
+    end
+end
+
+local function drawStylePage()
+    section("HUD")
+    local w = columnWidth(2)
+    if primaryButton("HIDE ALL HUD", w) then
+        run("Hide HUD", function()
+            setBoolGroup(HUD_PATH, false)
+            return "HUD hidden - press SHOW ALL HUD or the hotkey to bring it back"
+        end)
+    end
+    ImGui.SameLine()
+    if button("Show All HUD", w) then
+        run("Show HUD", function()
+            setBoolGroup(HUD_PATH, true)
+            return "HUD shown"
+        end)
+    end
+    hint("Or switch single parts on and off below. These are the game's own HUD settings.")
+    drawSettingsGroup(HUD_PATH, "hud")
+
+    section("Photo Tools")
+    local pw = columnWidth(3)
+    if button("Freeze World", pw) then
+        run("World frozen", function() applyGameSpeed(0.02) end)
+    end
+    ImGui.SameLine()
+    if button("Unfreeze", pw) then
+        run("Game speed normal", function() applyGameSpeed(1.0) end)
+    end
+    ImGui.SameLine()
+    if button("Clean Screenshot", pw) then
+        run("Clean screenshot", function()
+            setBoolGroup(HUD_PATH, false)
+            applyGameSpeed(0.02)
+            return "HUD hidden and world frozen - press Unfreeze and Show All HUD when done"
+        end)
+    end
+    hint("Field of view is on the Player page; time of day and weather are on the World page.")
+
+    section("Visual Effects")
+    hint("Turn film grain, chromatic aberration, lens flare, motion blur and the like on or off.")
+    drawSettingsGroup(VISUAL_PATH, "gfx")
+
+    section("Wardrobe")
+    if primaryButton("UNLOCK EVERY OUTFIT PIECE", availWidth()) then
+        run("Unlock wardrobe", unlockWardrobe)
+    end
+    local job = NCT.job
+    if job then
+        textColored(C.cyan, string.format("%s...  %d of %d", job.label, math.min(job.index - 1, #job.list), #job.list))
+        pcall(ImGui.ProgressBar, (job.index - 1) / #job.list, availWidth(), em(1))
+    end
+    hint("Puts every piece of clothing into the wardrobe at your stash for transmog, without filling "
+        .. "your inventory. To own a piece for real, use the Clothing tab of the Shop page.")
+end
+
 local HERO_VEHICLES = {
     { "Rayfield Caliburn", "Vehicle.v_sport1_rayfield_caliburn_player" },
     { "Rayfield Aerondight", "Vehicle.v_sport1_rayfield_aerondight_player" },
@@ -3095,6 +3316,7 @@ local HOTKEY_HELP = {
     "Flip vehicle upright", "Kill hostile enemies nearby", "Toggle Auto Skip Cutscenes",
     "Toggle Perfect Aim", "Toggle Free Instant Quickhacks", "Toggle One-Hit Kill", "Toggle Auto Loot",
     "Blink forward", "Teleport to first saved spot", "Turn every cheat off",
+    "Toggle HUD", "Quick save", "Cure all debuffs", "Skip one hour",
     "Fly: forward / back / left / right / up / down  (hold)",
 }
 
@@ -3142,6 +3364,7 @@ local PAGES = {
     { "Progress", drawProgressPage, "TrendingUp" },
     { "Shop", drawShopPage, "Cart" },
     { "Items", drawItemsPage, "PackageVariant" },
+    { "Style", drawStylePage, "Palette" },
     { "Vehicles", drawVehiclesPage, "Car" },
     { "World", drawWorldPage, "Earth" },
     { "Teleport", drawTeleportPage, "MapMarker" },
@@ -3461,6 +3684,22 @@ cheatHotkey("nct_auto_loot", "autoLoot")
 cheatHotkey("nct_auto_skip", "autoSkip")
 cheatHotkey("nct_perfect_aim", "perfectAim")
 cheatHotkey("nct_instant_hacks", "instantHacks")
+
+registerHotkey("nct_toggle_hud", "Toggle HUD", function()
+    run("Toggle HUD", toggleHud)
+end)
+
+registerHotkey("nct_quick_save", "Quick save", function()
+    run("Quick save", quickSave)
+end)
+
+registerHotkey("nct_cure", "Cure all debuffs", function()
+    run("Cure debuffs", cureDebuffs)
+end)
+
+registerHotkey("nct_skip_hour", "Skip one hour", function()
+    run("Skip time", function() return skipHours(1) end)
+end)
 
 registerHotkey("nct_flip_vehicle", "Flip vehicle upright", function()
     run("Vehicle flipped upright", flipVehicle)
