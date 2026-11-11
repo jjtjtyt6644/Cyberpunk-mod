@@ -3,7 +3,7 @@
 -- Open the CET overlay in game to show the menu.
 
 local NCT = {
-    version = "4.3.0",
+    version = "4.4.0",
     overlayOpen = false,
     page = "Home",
     tick = 0,
@@ -33,6 +33,11 @@ local NCT = {
     blinkDistance = 10,
     flySpeed = 15,
     xpMult = 1,
+    skipSpeed = 2,      -- how fast the skip helper presses: 1 balanced, 2 fast, 3 insane
+    fovValue = 80,
+    fovOn = false,
+    fovDefault = 0,     -- the game's own FOV, remembered the first time it is changed
+    profiles = { false, false, false },
     movementOn = false, -- these four remember whether a slider setting was applied
     cwOn = false,
     xpOn = false,
@@ -51,7 +56,7 @@ local SAVED_FIELDS = {
     "page", "speedMult", "jumpMult", "carryBonus", "cwCapacity", "gameSpeed", "hour", "moneyAmount",
     "level", "streetCred", "attrPoints", "perkPoints", "relicPoints", "attrValue", "itemId",
     "itemQty", "matQty", "blinkDistance", "flySpeed", "xpMult", "rememberCheats", "showPopups",
-    "movementOn", "cwOn", "xpOn", "speedOn",
+    "movementOn", "cwOn", "xpOn", "speedOn", "skipSpeed", "fovValue", "fovOn", "fovDefault",
 }
 
 local REASON = "NightCityTrainer"
@@ -192,8 +197,18 @@ local function setPolice(active)
     preventionSystem():QueueRequest(request)
 end
 
+-- Sets the wanted level: 0 clears it, 1 to 5 are the police heat stages.
+local function setWanted(level)
+    preventionSystem():ChangeHeatStage(EPreventionHeatStage["Heat_" .. level], REASON)
+end
+
 local function clearWanted()
-    preventionSystem():ChangeHeatStage(EPreventionHeatStage.Heat_0, REASON)
+    setWanted(0)
+end
+
+-- The player's first-person camera, used for the field of view.
+local function fppCamera()
+    return getPlayer():GetFPPCameraComponent()
 end
 
 ---------------------------------------------------------------------------
@@ -251,7 +266,7 @@ local function writeSkipFlag(active)
     pcall(function()
         local file = io.open("skip.flag", "w")
         if file then
-            file:write(os.time() .. " " .. (active and "1" or "0"))
+            file:write(os.time() .. " " .. (active and "1" or "0") .. " " .. NCT.skipSpeed)
             file:close()
         end
     end)
@@ -684,6 +699,42 @@ local CHEATS = {
         desc = "Headshots deal massively increased damage.",
         apply = statCheat("headshots", "HeadshotDamageMultiplier", "Additive", 10),
     },
+    perfectAim = {
+        label = "Perfect Aim",
+        desc = "No weapon recoil and no bullet spread.",
+        apply = multiStatCheat("perfectAim", {
+            { "RecoilKickMin", "Multiplier", 0 },
+            { "RecoilKickMax", "Multiplier", 0 },
+            { "SpreadDefaultX", "Multiplier", 0 },
+            { "SpreadDefaultY", "Multiplier", 0 },
+        }),
+    },
+    instantHacks = {
+        label = "Free Instant Quickhacks",
+        desc = "Quickhacks cost no RAM and cyberware has no cooldown.",
+        apply = multiStatCheat("instantHacks", {
+            { "MemoryCostReduction", "Additive", 100 },
+            { "QuickhacksCooldownReduction", "Additive", 100 },
+            { "CyberwareCooldownReduction", "Additive", 100 },
+        }),
+    },
+    rapidRecharge = {
+        label = "Rapid Item Recharge",
+        desc = "Max-Doc, grenades and Berserk recharge almost instantly.",
+        apply = multiStatCheat("rapidRecharge", {
+            { "HealingItemsChargesRegenRate", "Additive", 100 },
+            { "GrenadesChargesRegenRate", "Additive", 100 },
+            { "BerserkChargesRegenRate", "Additive", 100 },
+        }),
+    },
+    cheapVendors = {
+        label = "Vendor Discounts",
+        desc = "Vendors charge you far less and pay more for what you sell.",
+        apply = multiStatCheat("cheapVendors", {
+            { "VendorBuyPriceDiscount", "Additive", 0.9 },
+            { "VendorSellPriceDiscount", "Additive", 1.0 },
+        }),
+    },
     freezeClock = {
         label = "Freeze Time Of Day",
         desc = "The in-game clock stops, so it stays day or night.",
@@ -823,8 +874,25 @@ local function applyGameSpeed(speed)
     setGameSpeed(speed)
 end
 
+local function applyFov()
+    local camera = fppCamera()
+    -- Remember the game's own value before the first change so Reset can restore it.
+    if not NCT.fovOn and NCT.fovDefault == 0 then
+        local ok, current = pcall(function() return camera:GetFOV() end)
+        if ok and type(current) == "number" and current > 0 then NCT.fovDefault = current end
+    end
+    camera:SetFOV(NCT.fovValue)
+    NCT.fovOn = true
+end
+
+local function resetFov()
+    fppCamera():SetFOV(NCT.fovDefault > 0 and NCT.fovDefault or 68)
+    NCT.fovOn = false
+end
+
 -- Re-applies every slider setting that was switched on, e.g. after a restart.
 local function applyNumericSettings()
+    if NCT.fovOn then pcall(applyFov) end
     if NCT.movementOn then pcall(applyMovement) end
     if NCT.cwOn then pcall(applyCyberwareCapacity) end
     if NCT.xpOn then pcall(applyXpMultiplier) end
@@ -852,6 +920,7 @@ local function everythingOff()
         NCT.xpMult = 1
         applyXpMultiplier()
     end)
+    pcall(function() if NCT.fovOn then resetFov() end end)
     toast("Every cheat switched off", true)
 end
 
@@ -863,6 +932,10 @@ local LOADOUTS = {
         { "invisible", "silent", "noPolice" } },
     { "PARKOUR", "Double jump, air dash, endless stamina, no fall damage.",
         { "doubleJump", "airDash", "noFall", "infStamina" } },
+    { "SOLO", "Perfect aim, guaranteed crits, lethal headshots and endless ammo.",
+        { "perfectAim", "alwaysCrit", "megaCrit", "headshots", "infAmmo" } },
+    { "NETRUNNER", "Free instant quickhacks, endless RAM and fast item recharge.",
+        { "instantHacks", "infRam", "rapidRecharge" } },
 }
 
 local function applyLoadout(loadout)
@@ -882,6 +955,51 @@ local function applyLoadout(loadout)
 end
 
 ---------------------------------------------------------------------------
+-- Profiles: three save slots for your own set of cheats and slider settings.
+---------------------------------------------------------------------------
+
+local NUMERIC_KEYS = { "speedMult", "jumpMult", "carryBonus", "cwCapacity", "xpMult", "gameSpeed" }
+local PROFILE_SLOTS = 3
+
+local function captureProfile(index)
+    local profile = { name = "Profile " .. index, cheats = {}, numbers = {} }
+    for key in pairs(CHEATS) do
+        if NCT[key] and key ~= "fly" then profile.cheats[#profile.cheats + 1] = key end
+    end
+    table.sort(profile.cheats)
+    for _, field in ipairs(NUMERIC_KEYS) do profile.numbers[field] = NCT[field] end
+    return profile
+end
+
+local function loadProfile(profile)
+    local wanted = {}
+    for _, key in ipairs(profile.cheats) do wanted[key] = true end
+    -- Switch off whatever the profile does not use, then switch its cheats on.
+    for key, cheat in pairs(CHEATS) do
+        if NCT[key] and not wanted[key] then
+            if cheat.apply then pcall(cheat.apply, false) end
+            NCT[key] = false
+        end
+    end
+    for _, key in ipairs(profile.cheats) do
+        local cheat = CHEATS[key]
+        if cheat and not NCT[key] then
+            local ok = true
+            if cheat.apply then ok = pcall(cheat.apply, true) end
+            if ok then NCT[key] = true end
+        end
+    end
+    for _, field in ipairs(NUMERIC_KEYS) do
+        if type(profile.numbers[field]) == "number" then NCT[field] = profile.numbers[field] end
+    end
+    pcall(applyMovement)
+    pcall(applyCyberwareCapacity)
+    pcall(applyXpMultiplier)
+    pcall(function() applyGameSpeed(NCT.gameSpeed) end)
+    return "Loaded " .. profile.name .. " (" .. #profile.cheats .. " cheats)"
+end
+
+---------------------------------------------------------------------------
 -- Settings file (kept next to this script)
 ---------------------------------------------------------------------------
 
@@ -889,7 +1007,7 @@ end
 -- changed since the last write. Called every few seconds, when the menu
 -- closes and when the game shuts down, so nothing is lost on a crash.
 local function saveSettings()
-    local data = { spots = NCT.spots, active = {} }
+    local data = { spots = NCT.spots, profiles = NCT.profiles, active = {} }
     for _, field in ipairs(SAVED_FIELDS) do data[field] = NCT[field] end
     local keys = {}
     for key, cheat in pairs(CHEATS) do
@@ -930,6 +1048,22 @@ local function loadSettings()
         for _, spot in ipairs(data.spots) do
             if type(spot) == "table" and spot.x and spot.y and spot.z then
                 NCT.spots[#NCT.spots + 1] = { name = tostring(spot.name or "Spot"), x = spot.x, y = spot.y, z = spot.z }
+            end
+        end
+    end
+    if type(data.profiles) == "table" then
+        for i = 1, PROFILE_SLOTS do
+            local p = data.profiles[i]
+            NCT.profiles[i] = false
+            if type(p) == "table" and type(p.cheats) == "table" and type(p.numbers) == "table" then
+                local clean = { name = tostring(p.name or ("Profile " .. i)), cheats = {}, numbers = {} }
+                for _, key in ipairs(p.cheats) do
+                    if CHEATS[key] then clean.cheats[#clean.cheats + 1] = key end
+                end
+                for _, field in ipairs(NUMERIC_KEYS) do
+                    if type(p.numbers[field]) == "number" then clean.numbers[field] = p.numbers[field] end
+                end
+                NCT.profiles[i] = clean
             end
         end
     end
@@ -1326,6 +1460,37 @@ local function drawHomePage()
         run("Vehicle repaired", function() repairVehicle(requireVehicle()) end)
     end
 
+    section("Profiles")
+    hint("Save your current cheats and sliders in a slot, then bring them all back with one click.")
+    for i = 1, PROFILE_SLOTS do
+        local profile = NCT.profiles[i]
+        if profile then
+            textColored(C.text, profile.name .. "  (" .. #profile.cheats .. " cheats)")
+        else
+            textColored(C.dim, "Profile " .. i .. "  (empty)")
+        end
+        local bw = columnWidth(3)
+        if profile then
+            if primaryButton("LOAD##prof" .. i, bw) then
+                run("Load profile", function() return loadProfile(profile) end)
+            end
+        elseif button("Load##prof" .. i, bw) then
+            toast("Profile " .. i .. " is empty. Save to it first.", false)
+        end
+        ImGui.SameLine()
+        if button("Save Current##prof" .. i, bw) then
+            NCT.profiles[i] = captureProfile(i)
+            saveSettings()
+            toast("Saved your current setup to Profile " .. i, true)
+        end
+        ImGui.SameLine()
+        if button("Clear##prof" .. i, bw) then
+            NCT.profiles[i] = false
+            saveSettings()
+            toast("Profile " .. i .. " cleared", true)
+        end
+    end
+
     local active = {}
     for key, cheat in pairs(CHEATS) do
         if NCT[key] then active[#active + 1] = { key, cheat.label } end
@@ -1367,6 +1532,17 @@ local function drawPlayerPage()
     cheatToggle("doubleJump")
     cheatToggle("airDash")
     cheatToggle("silent")
+
+    section("Camera")
+    local fovApply
+    NCT.fovValue, fovApply = sliderFloat("fov", "Field of view", NCT.fovValue, 50, 130, "%.0f", "SET")
+    if fovApply then
+        run("Field of view " .. math.floor(NCT.fovValue), applyFov)
+    end
+    if button("Reset Field Of View", availWidth()) then
+        run("Field of view reset", resetFov)
+    end
+    hint("The game may reset the view while you aim down sights. It is re-applied every couple of seconds.")
 
     section("Movement")
     NCT.speedMult = sliderFloat("speed", "Run speed", NCT.speedMult, 1.0, 5.0, "x%.1f")
@@ -1494,6 +1670,28 @@ local function maxAttributes()
     return confirmed == #ATTRIBUTES
 end
 
+-- Refunds spent perk or attribute points, and reports how many points you have now.
+local function respec(kind)
+    local data = devData()
+    local pointType = kind == "attributes" and "Attribute" or "Primary"
+    local before = getDevPoints(pointType)
+    if kind == "attributes" then
+        if not pcall(function() data:ResetAttributes() end) then
+            error("this game version has no attribute reset")
+        end
+    elseif not pcall(function() data:ResetPerks() end) then
+        if not pcall(function() data:RemoveAllPerks() end) then
+            error("this game version has no perk reset")
+        end
+    end
+    local after = getDevPoints(pointType)
+    local name = kind == "attributes" and "Attribute" or "Perk"
+    if after > before then
+        return name .. " points refunded: " .. before .. " -> " .. after
+    end
+    return name .. " reset requested - check the character menu"
+end
+
 local function drawProgressPage()
     local info = NCT.info or {}
     local apply
@@ -1609,6 +1807,17 @@ local function drawProgressPage()
             return "Attribute changes requested - check the character menu"
         end)
     end
+
+    section("Free Respec")
+    local rw = columnWidth(2)
+    if button("Reset Perks", rw) then
+        run("Reset perks", function() return respec("perks") end)
+    end
+    ImGui.SameLine()
+    if button("Reset Attributes", rw) then
+        run("Reset attributes", function() return respec("attributes") end)
+    end
+    hint("Refunds your points so you can spend them again, at no cost.")
 end
 
 local MATERIALS = {
@@ -1740,6 +1949,20 @@ local function drawWorldPage()
         end
         textColored(C.dim, NCT.sceneActive and "A scene is playing right now." or "No scene is playing.")
     end
+    textColored(C.dim, "Skip speed")
+    local sw = columnWidth(3)
+    local speeds = { { 1, "Balanced" }, { 2, "Fast" }, { 3, "Insane" } }
+    for i, entry in ipairs(speeds) do
+        local label = entry[2] .. "##skipspeed"
+        if NCT.skipSpeed == entry[1] then
+            primaryButton(label, sw)
+        elseif button(label, sw) then
+            NCT.skipSpeed = entry[1]
+            toast("Skip speed: " .. entry[2], true)
+        end
+        if i < #speeds then ImGui.SameLine() end
+    end
+    hint("Balanced holds the key for a while. Insane taps it as fast as the game can read it.")
     hint("The launcher's skip helper presses Y whenever a cutscene or dialogue is playing. "
         .. "It only presses while Cyberpunk 2077 is the active window, and only while this switch is on.")
 
@@ -1748,9 +1971,15 @@ local function drawWorldPage()
         NCT.slowMo = false
         run(string.format("Game speed x%.2f", NCT.gameSpeed), function() applyGameSpeed(NCT.gameSpeed) end)
     end
-    if button("Back To Normal Speed", availWidth()) then
+    local gw = columnWidth(2)
+    if button("Back To Normal Speed", gw) then
         NCT.slowMo = false
         run("Game speed normal", function() applyGameSpeed(1.0) end)
+    end
+    ImGui.SameLine()
+    if button("Freeze World", gw) then
+        NCT.slowMo = false
+        run("World frozen", function() applyGameSpeed(0.02) end)
     end
 
     section("Weather")
@@ -1772,7 +2001,18 @@ local function drawWorldPage()
     if primaryButton("CLEAR WANTED LEVEL", availWidth()) then
         run("Wanted level cleared", clearWanted)
     end
-
+    textColored(C.dim, "Set wanted level")
+    local pw = columnWidth(5)
+    for level = 1, 5 do
+        if button(level .. " Star##wanted" .. level, pw) then
+            run("Wanted level " .. level, function()
+                setWanted(level)
+                return "Wanted level set to " .. level
+            end)
+        end
+        if level < 5 then ImGui.SameLine() end
+    end
+    hint("Turn Disable Police off first, or the police will ignore the new level.")
 end
 
 ---------------------------------------------------------------------------
@@ -2235,7 +2475,8 @@ local HOTKEY_HELP = {
     "Add E$ 100,000", "Heal to full", "Refill ammo", "Clear wanted level",
     "Toggle God Mode", "Toggle Infinite Ammo", "Toggle Slow Motion", "Toggle Fly Mode",
     "Toggle Indestructible Vehicle", "Repair vehicle", "Flip vehicle upright",
-    "Kill hostile enemies nearby", "Toggle Auto Skip Cutscenes",
+    "Kill hostile enemies nearby", "Toggle Auto Skip Cutscenes", "Toggle Perfect Aim",
+    "Toggle Free Instant Quickhacks",
     "Blink forward", "Teleport to first saved spot", "Turn every cheat off",
     "Fly: forward / back / up / down  (hold)",
 }
@@ -2429,6 +2670,26 @@ registerForEvent("onUpdate", function(delta)
     NCT.saveTick = (NCT.saveTick or 0) + delta
 
     if NCT.fly then pcall(updateFly, delta) end
+
+    -- Cutscene watch runs about 30 times a second so the helper reacts at once.
+    NCT.skipTick = (NCT.skipTick or 0) + delta
+    if NCT.skipTick >= 0.03 then
+        NCT.skipTick = 0
+        if NCT.autoSkip and getPlayer() then
+            local active = inScene()
+            NCT.sceneActive = active
+            local key = tostring(active) .. NCT.skipSpeed
+            -- Written on every change and once a second so the helper can tell we are alive.
+            if key ~= NCT.lastFlag or os.clock() - (NCT.flagTime or 0) >= 1 then
+                writeSkipFlag(active)
+                NCT.lastFlag, NCT.flagTime = key, os.clock()
+            end
+        elseif NCT.lastFlag ~= nil then
+            writeSkipFlag(false)
+            NCT.lastFlag, NCT.sceneActive = nil, nil
+        end
+    end
+
     pcall(stepShopBuild)
     pcall(stepBulk)
 
@@ -2452,16 +2713,6 @@ registerForEvent("onUpdate", function(delta)
 
         if NCT.autoSkip and present then
             pcall(autoSkipScenes)
-            local active = inScene()
-            NCT.sceneActive = active
-            -- Written on every change and once a second so the helper can tell we are alive.
-            if active ~= NCT.lastFlag or os.clock() - (NCT.flagTime or 0) >= 1 then
-                writeSkipFlag(active)
-                NCT.lastFlag, NCT.flagTime = active, os.clock()
-            end
-        elseif NCT.lastFlag ~= nil then
-            writeSkipFlag(false)
-            NCT.lastFlag, NCT.sceneActive = nil, nil
         end
         if (NCT.infStamina or NCT.infOxygen or NCT.infRam) and getPlayer() then
             pcall(function()
@@ -2488,6 +2739,7 @@ registerForEvent("onUpdate", function(delta)
             if NCT.godMode then pcall(setGodMode, true) end
             if NCT.noPolice then pcall(setPolice, false) end
             if NCT.carGod then pcall(protectVehicle) end
+            if NCT.fovOn then pcall(applyFov) end
             if NCT.infAmmo then
                 pcall(setInfiniteAmmoEffect, true)
                 pcall(topUpAmmo)
@@ -2542,6 +2794,8 @@ cheatHotkey("nct_slow_mo", "slowMo")
 cheatHotkey("nct_fly", "fly")
 cheatHotkey("nct_car_god", "carGod")
 cheatHotkey("nct_auto_skip", "autoSkip")
+cheatHotkey("nct_perfect_aim", "perfectAim")
+cheatHotkey("nct_instant_hacks", "instantHacks")
 
 registerHotkey("nct_repair_vehicle", "Repair vehicle", function()
     run("Vehicle repaired", function() repairVehicle(requireVehicle()) end)

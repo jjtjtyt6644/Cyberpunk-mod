@@ -550,7 +550,7 @@ namespace NightCityTrainer
         {
             if (dryRun)
             {
-                Log(log, down ? "DOWN " + key : "UP " + key);
+                Log(log, Environment.TickCount + (down ? " DOWN " : " UP ") + key);
                 return;
             }
             var input = new INPUT[1];
@@ -581,20 +581,35 @@ namespace NightCityTrainer
             catch { return false; }
         }
 
-        // Is the trainer reporting a scene right now? The report must be fresh,
+        // Is the trainer reporting a scene right now? Returns 0 when not, otherwise
+        // the skip speed (1 to 3) the player chose. The report must be fresh,
         // otherwise a crashed game could leave the key held down.
-        static bool SceneReported(string flagFile)
+        static int SceneSpeed(string flagFile)
         {
             try
             {
-                if (!File.Exists(flagFile)) return false;
+                if (!File.Exists(flagFile)) return 0;
                 string[] parts = File.ReadAllText(flagFile).Trim().Split(' ');
                 long stamp;
-                if (parts.Length != 2 || !long.TryParse(parts[0], out stamp)) return false;
+                // A half-written file (the trainer is saving it) reads as -1: "unknown, keep going".
+                if (parts.Length < 2 || !long.TryParse(parts[0], out stamp)) return -1;
                 long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                return Math.Abs(now - stamp) <= 3 && parts[1] == "1";
+                if (Math.Abs(now - stamp) > 3 || parts[1] != "1") return 0;
+                int speed;
+                if (parts.Length < 3 || !int.TryParse(parts[2], out speed)) speed = 2;
+                return Math.Max(1, Math.Min(3, speed));
             }
-            catch { return false; }
+            catch { return -1; }
+        }
+
+        // How each speed presses: hold the key for holdMs (for scenes you skip by
+        // holding), then tap it `taps` times, tapMs down and tapMs up. Speed 3 never
+        // holds and taps as fast as the game can read the key.
+        static void Pattern(int speed, out int holdMs, out int taps, out int tapMs)
+        {
+            if (speed == 1) { holdMs = 1200; taps = 3; tapMs = 55; }
+            else if (speed == 3) { holdMs = 0; taps = 1000000; tapMs = 30; }
+            else { holdMs = 600; taps = 4; tapMs = 45; }
         }
 
         public static void Run(string gameFolder, bool dryRun, bool ignoreFocus, int maxSeconds, string log)
@@ -611,9 +626,14 @@ namespace NightCityTrainer
                 bool held = false;
                 bool sawGame = false;
                 var clock = Stopwatch.StartNew();
-                var retap = Stopwatch.StartNew();
                 var heartbeat = Stopwatch.StartNew();
+                var gameCheck = Stopwatch.StartNew();
                 int missing = 0;
+                int phase = 0;          // 0 idle, 1 holding, 2 tap down, 3 tap up
+                long phaseStart = 0;
+                int tapsLeft = 0;
+                int lastSpeed = 0;
+                long lastGoodAt = 0;
 
                 AppDomain.CurrentDomain.ProcessExit += delegate { if (held) Send(key, false, dryRun, log); };
                 Log(log, "START key=" + key);
@@ -623,15 +643,16 @@ namespace NightCityTrainer
                     {
                         if (maxSeconds > 0 && clock.Elapsed.TotalSeconds > maxSeconds) break;
 
-                        if (!dryRun)
+                        if (!dryRun && gameCheck.ElapsedMilliseconds >= 500)
                         {
+                            gameCheck.Restart();
                             if (Core.IsGameRunning()) { sawGame = true; missing = 0; }
                             else
                             {
                                 missing++;
                                 // Wait up to five minutes for the game to start, then quit once it closes.
-                                if (sawGame && missing > 50) break;
-                                if (!sawGame && missing > 3000) break;
+                                if (sawGame && missing > 10) break;
+                                if (!sawGame && missing > 600) break;
                             }
                         }
 
@@ -646,27 +667,66 @@ namespace NightCityTrainer
                             catch { }
                         }
 
-                        bool active = SceneReported(flagFile) && (ignoreFocus || GameInFront());
-                        if (active && !held)
+                        long now = clock.ElapsedMilliseconds;
+                        int speed = SceneSpeed(flagFile);
+                        if (speed < 0)
                         {
-                            Send(key, true, dryRun, log);
-                            held = true;
-                            retap.Restart();
+                            // Unreadable for a moment: trust the last good reading for a short while.
+                            speed = now - lastGoodAt < 300 ? lastSpeed : 0;
                         }
-                        else if (active && retap.ElapsedMilliseconds > 1500)
+                        else
                         {
-                            // Release and press again, so prompts that need a fresh press also work.
-                            Send(key, false, dryRun, log);
-                            Thread.Sleep(40);
-                            Send(key, true, dryRun, log);
-                            retap.Restart();
+                            lastSpeed = speed;
+                            lastGoodAt = now;
                         }
-                        else if (!active && held)
+                        bool active = speed > 0 && (ignoreFocus || GameInFront());
+
+                        if (!active)
                         {
-                            Send(key, false, dryRun, log);
-                            held = false;
+                            if (held) { Send(key, false, dryRun, log); held = false; }
+                            phase = 0;
                         }
-                        Thread.Sleep(100);
+                        else
+                        {
+                            int holdMs, taps, tapMs;
+                            Pattern(speed, out holdMs, out taps, out tapMs);
+                            if (phase == 0)
+                            {
+                                Send(key, true, dryRun, log);
+                                held = true;
+                                phaseStart = now;
+                                if (holdMs > 0) { phase = 1; }
+                                else { phase = 2; tapsLeft = taps - 1; }
+                            }
+                            else if (phase == 1 && now - phaseStart >= holdMs)
+                            {
+                                Send(key, false, dryRun, log);
+                                held = false;
+                                phase = 3;
+                                phaseStart = now;
+                                tapsLeft = taps;
+                            }
+                            else if (phase == 2 && now - phaseStart >= tapMs)
+                            {
+                                Send(key, false, dryRun, log);
+                                held = false;
+                                phase = 3;
+                                phaseStart = now;
+                            }
+                            else if (phase == 3 && now - phaseStart >= tapMs)
+                            {
+                                if (tapsLeft <= 0) { phase = 0; }
+                                else
+                                {
+                                    Send(key, true, dryRun, log);
+                                    held = true;
+                                    phase = 2;
+                                    phaseStart = now;
+                                    tapsLeft--;
+                                }
+                            }
+                        }
+                        Thread.Sleep(10);
                     }
                 }
                 finally
