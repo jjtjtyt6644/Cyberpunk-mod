@@ -1,4 +1,6 @@
 {
-  "version": "4.8.0",
-  "url": "https://raw.githubusercontent.com/jjtjtyt6644/Cyberpunk-mod/main/dist/init.lua"
+  "version": "4.9.0",
+  "url": "https://raw.githubusercontent.com/jjtjtyt6644/Cyberpunk-mod/main/dist/init.lua",
+  "launcherVersion": "1.4.0",
+  "launcherUrl": "https://github.com/jjtjtyt6644/Cyberpunk-mod/releases/latest/download/NightCityTrainer.exe"
 }

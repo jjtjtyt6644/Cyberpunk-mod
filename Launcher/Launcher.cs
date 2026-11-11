@@ -40,6 +40,8 @@ namespace NightCityTrainer
     {
         public Version Version;
         public string Url;
+        public Version LauncherVersion;   // newest launcher, when the manifest names one
+        public string LauncherUrl;
     }
 
     // Everything that touches the disk or the network. No UI in here.
@@ -293,7 +295,7 @@ namespace NightCityTrainer
             }
         }
 
-        static void DownloadFile(string url, string target, Action<double> progress)
+        public static void DownloadFile(string url, string target, Action<double> progress)
         {
             using (var response = (HttpWebResponse)Request(url).GetResponse())
             using (Stream input = response.GetResponseStream())
@@ -323,7 +325,16 @@ namespace NightCityTrainer
             string url = Str(manifest, "url");
             if (!Version.TryParse(Str(manifest, "version") ?? "", out version) || string.IsNullOrEmpty(url))
                 throw new InvalidDataException("The update information is not valid.");
-            return new UpdateInfo { Version = version, Url = url };
+            var info = new UpdateInfo { Version = version, Url = url };
+            Version launcherVersion;
+            string launcherUrl = Str(manifest, "launcherUrl");
+            if (Version.TryParse(Str(manifest, "launcherVersion") ?? "", out launcherVersion)
+                && SelfInstall.IsTrustedDownload(launcherUrl))
+            {
+                info.LauncherVersion = launcherVersion;
+                info.LauncherUrl = launcherUrl;
+            }
+            return info;
         }
 
         public static string DownloadTrainer(UpdateInfo update)
@@ -462,6 +473,238 @@ namespace NightCityTrainer
                 info.WorkingDirectory = dir;
                 Process.Start(info);
             }
+        }
+    }
+
+    // Keeps one copy of the launcher in %LocalAppData%\NightCityTrainer, updates
+    // that copy from the GitHub release, and points the shortcuts at it.
+    public static class SelfInstall
+    {
+        const string TrustedPrefix = "https://github.com/jjtjtyt6644/Cyberpunk-mod/releases/";
+        public static string InstallDirOverride;   // tests only
+        public static string ShortcutDirOverride;  // tests only
+
+        public static bool IsTrustedDownload(string url)
+        {
+            return !string.IsNullOrEmpty(url) && url.StartsWith(TrustedPrefix, StringComparison.OrdinalIgnoreCase);
+        }
+
+        public static string InstallDir
+        {
+            get
+            {
+                if (!string.IsNullOrEmpty(InstallDirOverride)) return InstallDirOverride;
+                return IOPath.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "NightCityTrainer");
+            }
+        }
+
+        public static string InstalledExe
+        {
+            get { return IOPath.Combine(InstallDir, "NightCityTrainer.exe"); }
+        }
+
+        public static string RunningExe
+        {
+            get { return Assembly.GetExecutingAssembly().Location; }
+        }
+
+        public static Version Current
+        {
+            get { return Version.Parse(BuildInfo.LauncherVersion); }
+        }
+
+        static Version VersionOf(string exe)
+        {
+            try
+            {
+                if (!File.Exists(exe)) return null;
+                Version v;
+                return Version.TryParse(FileVersionInfo.GetVersionInfo(exe).FileVersion ?? "", out v) ? v : new Version(0, 0);
+            }
+            catch { return null; }
+        }
+
+        static bool SamePath(string a, string b)
+        {
+            return string.Equals(IOPath.GetFullPath(a), IOPath.GetFullPath(b), StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Removes copies left behind by an earlier update.
+        public static void CleanUp()
+        {
+            foreach (string dir in new[] { InstallDir, IOPath.GetDirectoryName(RunningExe) })
+            {
+                try
+                {
+                    if (!Directory.Exists(dir)) continue;
+                    foreach (string old in Directory.GetFiles(dir, "NightCityTrainer*.old"))
+                    {
+                        try { File.Delete(old); } catch { }
+                    }
+                }
+                catch { }
+            }
+        }
+
+        // Puts this launcher into the install folder when that copy is missing or older.
+        // Returns the path of a newer installed copy that should run instead, or null.
+        public static string EnsureInstalled()
+        {
+            if (SamePath(RunningExe, InstalledExe)) return null;
+            Version installed = VersionOf(InstalledExe);
+            if (installed != null && installed > Current) return InstalledExe;
+            if (installed == null || installed < Current)
+            {
+                Directory.CreateDirectory(InstallDir);
+                ReplaceFile(RunningExe, InstalledExe);
+            }
+            return null;
+        }
+
+        // Writes `source` over `target`, even while `target` is the running program:
+        // Windows allows renaming a running exe, so the old one is moved aside first.
+        static void ReplaceFile(string source, string target)
+        {
+            string temp = target + ".new";
+            File.Copy(source, temp, true);
+            if (File.Exists(target))
+            {
+                string aside = target + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".old";
+                File.Move(target, aside);
+                try { File.Delete(aside); } catch { }
+            }
+            File.Move(temp, target);
+        }
+
+        // Downloads the newest launcher into the install folder. Returns its path.
+        public static string DownloadUpdate(UpdateInfo update, Action<double> progress)
+        {
+            if (!IsTrustedDownload(update.LauncherUrl)) throw new InvalidDataException("Untrusted update address.");
+            Directory.CreateDirectory(InstallDir);
+            string download = IOPath.Combine(InstallDir, "NightCityTrainer.download");
+            Core.DownloadFile(update.LauncherUrl, download, progress);
+            try
+            {
+                var info = new FileInfo(download);
+                byte[] head = new byte[2];
+                using (FileStream f = File.OpenRead(download)) f.Read(head, 0, 2);
+                if (info.Length < 50000 || head[0] != (byte)'M' || head[1] != (byte)'Z')
+                    throw new InvalidDataException("The downloaded launcher is not a valid program.");
+                Version got = VersionOf(download);
+                if (got == null || got < update.LauncherVersion)
+                    throw new InvalidDataException("The downloaded launcher is not the expected version.");
+                ReplaceFile(download, InstalledExe);
+            }
+            finally
+            {
+                try { if (File.Exists(download)) File.Delete(download); } catch { }
+            }
+            return InstalledExe;
+        }
+
+        static void CreateShortcut(string lnk, string target, string args, string description)
+        {
+            Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+            object shell = Activator.CreateInstance(shellType);
+            try
+            {
+                object sc = shellType.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { lnk });
+                Type t = sc.GetType();
+                t.InvokeMember("TargetPath", BindingFlags.SetProperty, null, sc, new object[] { target });
+                t.InvokeMember("Arguments", BindingFlags.SetProperty, null, sc, new object[] { args });
+                t.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, sc, new object[] { IOPath.GetDirectoryName(target) });
+                t.InvokeMember("IconLocation", BindingFlags.SetProperty, null, sc, new object[] { target + ",0" });
+                t.InvokeMember("Description", BindingFlags.SetProperty, null, sc, new object[] { description });
+                t.InvokeMember("Save", BindingFlags.InvokeMethod, null, sc, null);
+                Marshal.FinalReleaseComObject(sc);
+            }
+            finally { Marshal.FinalReleaseComObject(shell); }
+        }
+
+        static string Folder(Environment.SpecialFolder folder, string testName)
+        {
+            if (!string.IsNullOrEmpty(ShortcutDirOverride))
+            {
+                string dir = IOPath.Combine(ShortcutDirOverride, testName);
+                Directory.CreateDirectory(dir);
+                return dir;
+            }
+            return Environment.GetFolderPath(folder);
+        }
+
+        const string ShortcutName = "Night City Trainer.lnk";
+
+        static string StartupShortcut
+        {
+            get { return IOPath.Combine(Folder(Environment.SpecialFolder.Startup, "Startup"), ShortcutName); }
+        }
+
+        static string StartupSettingFile
+        {
+            get { return IOPath.Combine(IOPath.GetDirectoryName(Core.SettingsFile), "start-with-windows.txt"); }
+        }
+
+        // On unless the player switched it off.
+        public static bool StartWithWindows()
+        {
+            try { return !(File.Exists(StartupSettingFile) && File.ReadAllText(StartupSettingFile).Trim() == "0"); }
+            catch { return true; }
+        }
+
+        public static void SetStartWithWindows(bool enabled)
+        {
+            try
+            {
+                Directory.CreateDirectory(IOPath.GetDirectoryName(StartupSettingFile));
+                File.WriteAllText(StartupSettingFile, enabled ? "1" : "0");
+            }
+            catch { }
+            UpdateStartupShortcut();
+        }
+
+        public static void UpdateStartupShortcut()
+        {
+            try
+            {
+                if (StartWithWindows())
+                    CreateShortcut(StartupShortcut, InstalledExe, "--startup", "Night City Trainer (checks for updates)");
+                else if (File.Exists(StartupShortcut))
+                    File.Delete(StartupShortcut);
+            }
+            catch { }
+        }
+
+        // Desktop and Start menu shortcuts, always pointing at the installed copy.
+        public static void EnsureShortcuts()
+        {
+            if (!File.Exists(InstalledExe)) return;
+            try
+            {
+                CreateShortcut(IOPath.Combine(Folder(Environment.SpecialFolder.DesktopDirectory, "Desktop"), ShortcutName),
+                    InstalledExe, "", "Night City Trainer");
+            }
+            catch { }
+            try
+            {
+                CreateShortcut(IOPath.Combine(Folder(Environment.SpecialFolder.Programs, "StartMenu"), ShortcutName),
+                    InstalledExe, "", "Night City Trainer");
+            }
+            catch { }
+            UpdateStartupShortcut();
+        }
+
+        // Starts another copy of the launcher with the same switches, plus extra ones.
+        public static void Relaunch(string exe, string[] args, string extra)
+        {
+            var sb = new StringBuilder();
+            foreach (string a in args)
+            {
+                if (a == "--updated") continue;
+                sb.Append(a.Contains(" ") ? "\"" + a + "\"" : a).Append(' ');
+            }
+            sb.Append(extra);
+            Process.Start(new ProcessStartInfo(exe, sb.ToString()) { UseShellExecute = false });
         }
     }
 
@@ -759,6 +1002,8 @@ namespace NightCityTrainer
         readonly System.Windows.Shapes.Ellipse dotGame, dotCet, dotTrainer, dotUpdate;
         readonly Border progressTrack, progressFill;
         readonly CheckBox skipCheck;
+        readonly CheckBox startupCheck;
+        public static string[] LaunchArgs = new string[0];
 
         readonly Dictionary<string, string> options;
         readonly Version bundledVersion;
@@ -801,6 +1046,22 @@ namespace NightCityTrainer
             skipCheck.Content = "Auto-skip cutscenes (presses " + SkipHelper.SkipKey() + " for you)";
             skipCheck.Checked += delegate { Core.SetSkipHelperEnabled(true); };
             skipCheck.Unchecked += delegate { Core.SetSkipHelperEnabled(false); };
+            startupCheck = Find<CheckBox>("StartupCheck");
+            startupCheck.IsChecked = SelfInstall.StartWithWindows();
+            startupCheck.Checked += delegate { SelfInstall.SetStartWithWindows(true); };
+            startupCheck.Unchecked += delegate { SelfInstall.SetStartWithWindows(false); };
+
+            try
+            {
+                using (Stream iconStream = Assembly.GetExecutingAssembly().GetManifestResourceStream("icon.ico"))
+                {
+                    var icon = BitmapFrame.Create(iconStream, BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+                    window.Icon = icon;
+                    Find<Image>("TitleIcon").Source = icon;
+                }
+            }
+            catch { }
+            if (options.ContainsKey("startup")) window.WindowState = WindowState.Minimized;
 
             Find<TextBlock>("LauncherVersion").Text = "Launcher " + BuildInfo.LauncherVersion;
             Find<Grid>("TitleBar").MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
@@ -840,6 +1101,23 @@ namespace NightCityTrainer
             try { update = await Task.Run(() => Core.CheckForUpdate()); }
             catch { updateCheckFailed = true; }
 
+            if (await UpdateLauncherIfNeeded()) return;
+            if (!options.ContainsKey("no-self-install"))
+            {
+                try
+                {
+                    string newer = await Task.Run(() => SelfInstall.EnsureInstalled());
+                    if (newer != null)
+                    {
+                        SelfInstall.Relaunch(newer, LaunchArgs, "");
+                        window.Close();
+                        return;
+                    }
+                    await Task.Run(() => SelfInstall.EnsureShortcuts());
+                }
+                catch (Exception ex) { Log("Self install failed: " + ex.Message); }
+            }
+
             Refresh();
 
             if (options.ContainsKey("install")) await InstallOrUpdate(false);
@@ -852,6 +1130,31 @@ namespace NightCityTrainer
             if (options.ContainsKey("shot")) await SaveScreenshot(options["shot"]);
             if (options.ContainsKey("status")) File.WriteAllText(options["status"], DescribeState());
             if (options.ContainsKey("exit")) window.Close();
+        }
+
+        // Replaces this launcher with the newest release when one is out, then
+        // restarts into it. Returns true when the window is closing for the restart.
+        async Task<bool> UpdateLauncherIfNeeded()
+        {
+            if (options.ContainsKey("no-self-update") || update == null || update.LauncherVersion == null) return false;
+            if (update.LauncherVersion <= SelfInstall.Current) return false;
+            try
+            {
+                activity.Text = "Updating the launcher to v" + update.LauncherVersion + "...";
+                Fade(progressTrack, 1, 250);
+                UpdateInfo target = update;
+                string exe = await Task.Run(() => SelfInstall.DownloadUpdate(target, p => Ui(() => SetProgress(p, true))));
+                Log("Launcher updated to " + target.LauncherVersion);
+                SelfInstall.Relaunch(exe, LaunchArgs, "--updated");
+                window.Close();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Fade(progressTrack, 0, 250);
+                Log("Launcher update failed: " + ex.Message);
+                return false;
+            }
         }
 
         // ---- State ------------------------------------------------------------
@@ -962,6 +1265,9 @@ namespace NightCityTrainer
             sb.AppendLine("latest=" + LatestVersion());
             sb.AppendLine("updateCheckFailed=" + updateCheckFailed);
             sb.AppendLine("action=" + mainAction);
+            sb.AppendLine("launcher=" + BuildInfo.LauncherVersion);
+            sb.AppendLine("running=" + SelfInstall.RunningExe);
+            sb.AppendLine("installed=" + SelfInstall.InstalledExe + "|" + File.Exists(SelfInstall.InstalledExe));
             sb.AppendLine("activity=" + activity.Text);
             return sb.ToString();
         }
@@ -1141,7 +1447,13 @@ namespace NightCityTrainer
             try
             {
                 Core.UninstallTrainer(game.Path);
-                if (removeCet) Core.UninstallCet(game.Path);
+                if (removeCet)
+                {
+                    Core.UninstallCet(game.Path);
+                    // Nothing left to keep up to date, so stop starting with Windows.
+                    SelfInstall.SetStartWithWindows(false);
+                    startupCheck.IsChecked = false;
+                }
                 Refresh();
                 activity.Text = removeCet ? "Trainer and Cyber Engine Tweaks removed." : "Trainer removed.";
             }
@@ -1270,6 +1582,8 @@ namespace NightCityTrainer
             // Developer switches used for testing: --game <folder> --install --shot <png>
             // --status <txt> --log <txt> --ignore-running --uninstall-all --exit
             // Skip helper: --skiphelper --game <folder> [--dry-run --ignore-focus --max-seconds <n> --log <txt>]
+            // Self install and update: --install-dir <dir> --shortcut-dir <dir> --no-self-update --no-self-install
+            // --startup (start minimised)
             var options = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < args.Length; i++)
             {
@@ -1278,6 +1592,12 @@ namespace NightCityTrainer
                 bool hasValue = i + 1 < args.Length && !args[i + 1].StartsWith("--");
                 options[key] = hasValue ? args[++i] : "";
             }
+
+            string overrideDir;
+            if (options.TryGetValue("install-dir", out overrideDir)) SelfInstall.InstallDirOverride = overrideDir;
+            if (options.TryGetValue("shortcut-dir", out overrideDir)) SelfInstall.ShortcutDirOverride = overrideDir;
+            LauncherWindow.LaunchArgs = args;
+            SelfInstall.CleanUp();
 
             // Hidden background mode: press the skip key during cutscenes, then exit with the game.
             if (options.ContainsKey("skiphelper"))

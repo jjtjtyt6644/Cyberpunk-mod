@@ -3,7 +3,7 @@
 -- Open the CET overlay in game to show the menu.
 
 local NCT = {
-    version = "4.8.0",
+    version = "4.9.0",
     overlayOpen = false,
     page = "Home",
     tick = 0,
@@ -42,6 +42,7 @@ local NCT = {
     fovOn = false,
     fovDefault = 0,     -- the game's own FOV, remembered the first time it is changed
     profiles = { false, false, false },
+    checklist = {},     -- test checklist answers: item -> { state, note }
     movementOn = false, -- these four remember whether a slider setting was applied
     cwOn = false,
     xpOn = false,
@@ -1172,7 +1173,7 @@ end
 -- changed since the last write. Called every few seconds, when the menu
 -- closes and when the game shuts down, so nothing is lost on a crash.
 local function saveSettings()
-    local data = { spots = NCT.spots, profiles = NCT.profiles, active = {} }
+    local data = { spots = NCT.spots, profiles = NCT.profiles, checklist = NCT.checklist, active = {} }
     for _, field in ipairs(SAVED_FIELDS) do data[field] = NCT[field] end
     local keys = {}
     for key, cheat in pairs(CHEATS) do
@@ -1213,6 +1214,16 @@ local function loadSettings()
         for _, spot in ipairs(data.spots) do
             if type(spot) == "table" and spot.x and spot.y and spot.z then
                 NCT.spots[#NCT.spots + 1] = { name = tostring(spot.name or "Spot"), x = spot.x, y = spot.y, z = spot.z }
+            end
+        end
+    end
+    if type(data.checklist) == "table" then
+        for item, entry in pairs(data.checklist) do
+            if type(item) == "string" and type(entry) == "table" then
+                NCT.checklist[item] = {
+                    state = (entry.state == "ok" or entry.state == "bad" or entry.state == "skip") and entry.state or nil,
+                    note = type(entry.note) == "string" and entry.note or "",
+                }
             end
         end
     end
@@ -1418,14 +1429,66 @@ local function hint(text) wrapped(C.dim, text) end
 local function warn(text) wrapped(C.red, text) end
 
 local firstSection = true
+local canDraw -- defined with the switch widget below
 
+-- Animation state shared by the menu: frame time, the sliding sidebar
+-- highlight, and when the current page was opened.
+local anim = { last = os.clock(), dt = 0, navY = nil, pageAt = 0, pageName = nil }
+
+local function u32(c, alpha)
+    return ImGui.GetColorU32(c[1], c[2], c[3], alpha == nil and (c[4] or 1) or alpha)
+end
+
+local function easeOut(t)
+    t = math.max(0, math.min(1, t))
+    return 1 - (1 - t) ^ 3
+end
+
+local function fillRect(dl, x1, y1, x2, y2, color, rounding)
+    ImGui.ImDrawListAddRectFilled(dl, x1, y1, x2, y2, color, rounding or 0)
+end
+
+local function gradientRect(dl, x1, y1, x2, y2, left, right)
+    if x2 <= x1 or y2 <= y1 then return end
+    if not pcall(ImGui.ImDrawListAddRectFilledMultiColor, dl, x1, y1, x2, y2, left, right, right, left) then
+        fillRect(dl, x1, y1, x2, y2, left)
+    end
+end
+
+local function hline(dl, x1, x2, y, color, thickness)
+    if not pcall(ImGui.ImDrawListAddLine, dl, x1, y, x2, y, color, thickness or 1) then
+        fillRect(dl, x1, y, x2, y + (thickness or 1), color)
+    end
+end
+
+local function textWidth(text)
+    local w = ImGui.CalcTextSize(text)
+    return w
+end
+
+-- Section title: a yellow tick, the title in cyan, and a fine rule to the edge.
 local function section(title)
     if not firstSection then
-        ImGui.Dummy(0, em(0.4))
+        ImGui.Dummy(0, em(0.5))
     end
     firstSection = false
-    textColored(C.cyan, string.upper(title))
-    ImGui.Separator()
+    local upper = string.upper(title)
+    local fancy = canDraw and canDraw() and pcall(function()
+        local dl = ImGui.GetWindowDrawList()
+        local x, y = ImGui.GetCursorScreenPos()
+        local w = availWidth()
+        local fh = ImGui.GetFontSize()
+        fillRect(dl, x, y + 2, x + 3, y + fh - 1, u32(C.yellow), 1)
+        local tw = textWidth(upper)
+        hline(dl, x + em(0.6) + tw + em(0.7), x + w, y + fh / 2 + 1, u32(C.cyan, 0.18), 1)
+        ImGui.SetCursorScreenPos(x + em(0.6), y)
+        textColored(C.cyan, upper)
+        ImGui.Dummy(0, em(0.15))
+    end)
+    if not fancy then
+        textColored(C.cyan, upper)
+        ImGui.Separator()
+    end
 end
 
 -- Yellow call-to-action button with dark text.
@@ -1474,7 +1537,7 @@ end
 local drawSupported = nil
 local switchAnim = {}
 
-local function canDraw()
+function canDraw()
     if drawSupported == nil then
         drawSupported = pcall(function()
             local dl = ImGui.GetWindowDrawList()
@@ -1539,12 +1602,19 @@ end
 
 -- Small boxed figure for the dashboard.
 local function statTile(id, label, value, width)
+    local x, y = ImGui.GetCursorScreenPos()
     ImGui.PushStyleColor(ImGuiCol.ChildBg, C.panel[1], C.panel[2], C.panel[3], 1)
     ImGui.BeginChild("##tile_" .. id, width, em(4.6), true, ImGuiWindowFlags.NoScrollbar)
     textColored(C.dim, label)
     textColored(C.yellow, value)
     ImGui.EndChild()
     ImGui.PopStyleColor(1)
+    if canDraw() then
+        pcall(function()
+            local dl = ImGui.GetWindowDrawList()
+            gradientRect(dl, x + 2, y, x + width - 2, y + 2, u32(C.yellow), u32(C.cyan, 0.6))
+        end)
+    end
 end
 
 -- Labelled controls. The label sits above the control; when `actionLabel` is
@@ -3355,6 +3425,158 @@ local function drawSettingsPage()
     end
 end
 
+---------------------------------------------------------------------------
+-- Test checklist: tick what works and what is broken, and the trainer writes
+-- test-report.txt next to itself so it can be read and fixed.
+---------------------------------------------------------------------------
+
+local CHECKLIST = {
+    { "Player", {
+        "God Mode (no damage, explosions too)", "Infinite Stamina", "Infinite Oxygen", "Infinite RAM",
+        "Rapid Health Regen", "Status Immunity", "No Fall Damage (high falls too)", "Double Jump",
+        "Air Dash", "Silent Movement", "Field of view", "Run speed / jump height / carry weight",
+    } },
+    { "Combat", {
+        "Infinite Ammo", "Perfect Aim", "One-Hit Kill", "Always Crit", "Mega Crit Damage", "Tank Armor",
+        "Invisible (also when enemies already locked on)", "Free Instant Quickhacks", "Rapid Item Recharge",
+        "Kill Enemies Nearby", "Auto Loot", "Slow Motion",
+    } },
+    { "Money and Shop", {
+        "Add money", "Shop: buy (free)", "Shop: pay with eddies", "Shop: sell", "Sell All Junk",
+        "Unlock all weapons / iconics / clothing", "Vendor Discounts", "Spawn item by ID",
+    } },
+    { "Progress", {
+        "Give perk points", "Give attribute points", "Give relic points", "Level up / street cred up",
+        "Set skill levels", "+XP to every skill", "XP multiplier", "Max All Perks", "Upgrade All Cyberware",
+        "Upgrade held weapon", "Unlock all crafting recipes", "Free respec", "Max Out Everything",
+    } },
+    { "Vehicles", {
+        "Repair & Call Vehicle (after it was wrecked)", "Flip Upright", "Open / close doors", "Next radio station",
+        "Boost forward", "Dream Garage cars", "Unlock all vehicles",
+    } },
+    { "World and Teleport", {
+        "Time of day / skip time", "Freeze time of day", "Weather", "Disable Police", "Wanted level stars",
+        "Clear wanted level", "Game speed / freeze world", "Fly mode (steering and strafing)", "Blink forward",
+        "Saved teleport spots",
+    } },
+    { "Style", {
+        "Hide all HUD / single HUD parts", "Visual effects switches", "Clean screenshot", "Wardrobe unlock",
+    } },
+    { "Everyday", {
+        "Auto skip cutscenes (presses Y)", "Quick save", "Cure all debuffs", "Profiles", "Loadouts",
+        "Cheats come back after restarting the game", "Cheats come back after dying", "Achievements unlock",
+        "Hotkeys",
+    } },
+}
+
+local CHECK_LABELS = { ok = "WORKS", bad = "BROKEN", skip = "SKIPPED" }
+
+-- Builds the report text and the totals, without writing anything.
+local function buildReport()
+    local lines = {}
+    local counts = { ok = 0, bad = 0, skip = 0, none = 0 }
+    for _, group in ipairs(CHECKLIST) do
+        lines[#lines + 1] = "[" .. group[1] .. "]"
+        for _, item in ipairs(group[2]) do
+            local entry = NCT.checklist[item]
+            local state = entry and entry.state or "none"
+            counts[state] = (counts[state] or 0) + 1
+            local line = string.format("  %-11s %s", CHECK_LABELS[state] or "NOT TESTED", item)
+            if entry and entry.note and entry.note ~= "" then line = line .. "   -- " .. entry.note end
+            lines[#lines + 1] = line
+        end
+        lines[#lines + 1] = ""
+    end
+    local header = {
+        "Night City Trainer v" .. NCT.version .. " test report  (" .. os.date("%Y-%m-%d %H:%M") .. ")",
+        string.format("Works: %d   Broken: %d   Skipped: %d   Not tested: %d",
+            counts.ok, counts.bad, counts.skip, counts.none),
+        "",
+    }
+    return table.concat(header, "\n") .. table.concat(lines, "\n"), counts
+end
+
+-- Saves the report to test-report.txt. Called only when an answer changes.
+local function writeReport()
+    local text, counts = buildReport()
+    pcall(function()
+        local file = io.open("test-report.txt", "w")
+        if file then
+            file:write(text)
+            file:close()
+        end
+    end)
+    return text, counts
+end
+
+local function choiceButton(label, active, color, width)
+    if active then
+        ImGui.PushStyleColor(ImGuiCol.Button, color[1], color[2], color[3], 0.85)
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, color[1], color[2], color[3], 1)
+        ImGui.PushStyleColor(ImGuiCol.Text, C.black[1], C.black[2], C.black[3], 1)
+    end
+    local pressed = ImGui.Button(label, width, 0)
+    if active then ImGui.PopStyleColor(3) end
+    return pressed
+end
+
+local function drawChecklistPage()
+    local _, counts = buildReport()
+    section("Test Checklist")
+    hint("Try each feature in the game, then mark it. Your answers are saved straight away to "
+        .. "test-report.txt in the trainer's folder, so they can be read and fixed. Add a note for anything broken.")
+    textColored(C.text, string.format("Works %d    Broken %d    Skipped %d    Not tested %d",
+        counts.ok, counts.bad, counts.skip, counts.none))
+    local w = columnWidth(2)
+    if button("Copy Report", w) then
+        local text = writeReport()
+        if pcall(ImGui.SetClipboardText, text) then
+            toast("Report copied - paste it in the chat", true)
+        else
+            toast("Copy is not available - the report is saved in test-report.txt", false)
+        end
+    end
+    ImGui.SameLine()
+    if dangerButton("Clear All Answers", w) then
+        NCT.checklist = {}
+        writeReport()
+        toast("Checklist cleared", true)
+    end
+
+    local bw = em(5.2)
+    for _, group in ipairs(CHECKLIST) do
+        section(group[1])
+        for i, item in ipairs(group[2]) do
+            local entry = NCT.checklist[item] or {}
+            local id = group[1] .. i
+            local function mark(state)
+                if entry.state == state then entry.state = nil else entry.state = state end
+                NCT.checklist[item] = entry
+                writeReport()
+            end
+            if choiceButton("Works##ok" .. id, entry.state == "ok", C.green, bw) then mark("ok") end
+            ImGui.SameLine()
+            if choiceButton("Broken##bad" .. id, entry.state == "bad", C.red, bw) then mark("bad") end
+            ImGui.SameLine()
+            if choiceButton("Skip##skip" .. id, entry.state == "skip", C.dim, bw) then mark("skip") end
+            ImGui.SameLine()
+            local color = entry.state == "ok" and C.green or (entry.state == "bad" and C.red or C.text)
+            textColored(color, item)
+            if entry.state == "bad" then
+                ImGui.PushItemWidth(availWidth())
+                local note = ImGui.InputText("##note" .. id, entry.note or "", 160)
+                ImGui.PopItemWidth()
+                if type(note) == "string" and note ~= (entry.note or "") then
+                    entry.note = note
+                    NCT.checklist[item] = entry
+                    writeReport()
+                end
+                if (entry.note or "") == "" then hint("What went wrong? (optional)") end
+            end
+        end
+    end
+end
+
 -- name, draw function, icon name (from CET's bundled icon font)
 local PAGES = {
     { "Home", drawHomePage, "Home" },
@@ -3370,6 +3592,7 @@ local PAGES = {
     { "Teleport", drawTeleportPage, "MapMarker" },
     { "Achievements", drawAchievementsPage, "Trophy" },
     { "Settings", drawSettingsPage, "Cog" },
+    { "Test", drawChecklistPage, "ClipboardCheck" },
 }
 
 local function pageIcon(name)
@@ -3382,7 +3605,68 @@ end
 -- Window
 ---------------------------------------------------------------------------
 
-local function drawHeader()
+-- A rounded label with text inside. Returns its width.
+local function pill(dl, x, y, text, fg, bg, dot)
+    local pad = em(0.55)
+    local extra = dot and em(0.8) or 0
+    local w = textWidth(text) + pad * 2 + extra
+    local h = ImGui.GetFontSize() + em(0.45)
+    fillRect(dl, x, y, x + w, y + h, bg, h / 2)
+    if dot then
+        local pulse = 0.45 + 0.55 * (0.5 + 0.5 * math.sin(os.clock() * 4))
+        ImGui.ImDrawListAddCircleFilled(dl, x + pad + em(0.2), y + h / 2, em(0.22), u32(fg, pulse), 12)
+    end
+    ImGui.SetCursorScreenPos(x + pad + extra, y + em(0.22))
+    textColored(fg, text)
+    return w
+end
+
+-- Banner across the top: title, live status pills, and a light that sweeps
+-- along the bottom edge.
+local function drawFancyHeader()
+    local dl = ImGui.GetWindowDrawList()
+    local x, y = ImGui.GetCursorScreenPos()
+    local w = availWidth()
+    local h = em(4.4)
+    local now = os.clock()
+
+    gradientRect(dl, x, y, x + w, y + h, u32(C.panel, 0.95), u32(C.side, 0.6))
+    fillRect(dl, x, y, x + em(0.3), y + h, u32(C.yellow))
+    hline(dl, x, x + w, y + h - 1, u32(C.cyan, 0.2), 1)
+    local band = em(9)
+    local sweep = (now * 0.3) % 1
+    local sx = x - band + sweep * (w + band)
+    gradientRect(dl, math.max(x, sx), y + h - 2, math.min(x + w, sx + band), y + h, u32(C.cyan, 0), u32(C.cyan, 0.9))
+
+    ImGui.SetCursorScreenPos(x + em(1.0), y + em(0.5))
+    textColored(C.yellow, "NIGHT CITY TRAINER")
+    ImGui.SameLine()
+    textColored(C.dim, "v" .. NCT.version)
+
+    local px, py = x + em(1.0), y + em(2.25)
+    local gap = em(0.4)
+    local info = NCT.info
+    if info then
+        px = px + pill(dl, px, py, "ONLINE", C.green, u32(C.green, 0.12), true) + gap
+        local parts = {}
+        if info.level then parts[#parts + 1] = "LVL " .. info.level end
+        if info.cred then parts[#parts + 1] = "CRED " .. info.cred end
+        if info.money then parts[#parts + 1] = "E$ " .. formatNumber(info.money) end
+        for _, text in ipairs(parts) do
+            px = px + pill(dl, px, py, text, C.text, u32(C.panelHi, 0.9)) + gap
+        end
+        local active = activeCheatCount()
+        pill(dl, px, py, active .. (active == 1 and " CHEAT ON" or " CHEATS ON"), C.black, u32(C.yellow, 0.95))
+    else
+        px = px + pill(dl, px, py, "NO SAVE LOADED", C.red, u32(C.red, 0.14), true) + gap
+        ImGui.SetCursorScreenPos(px, py + em(0.22))
+        textColored(C.dim, "load a save to enable the cheats")
+    end
+    ImGui.SetCursorScreenPos(x, y + h + GAP)
+    ImGui.Dummy(0, 0)
+end
+
+local function drawPlainHeader()
     textColored(C.yellow, "NIGHT CITY TRAINER")
     ImGui.SameLine()
     textColored(C.dim, "v" .. NCT.version)
@@ -3403,9 +3687,57 @@ local function drawHeader()
         ImGui.SameLine()
         textColored(C.dim, "load a save to enable the cheats")
     end
+    ImGui.Separator()
 end
 
-local function drawSidebar()
+local function drawHeader()
+    if not (canDraw() and pcall(drawFancyHeader)) then drawPlainHeader() end
+end
+
+local function openPage(name)
+    if NCT.page ~= name then
+        NCT.page = name
+        anim.pageAt = os.clock()
+    end
+end
+
+-- Sidebar with a highlight that glides to the selected page.
+local function drawFancySidebar()
+    local dl = ImGui.GetWindowDrawList()
+    local w = availWidth()
+    local h = em(1.95)
+    local step = h + 4
+    local x0, y0 = ImGui.GetCursorScreenPos()
+
+    local selected = 1
+    for i, page in ipairs(PAGES) do
+        if page[1] == NCT.page then selected = i end
+    end
+    local target = y0 + (selected - 1) * step
+    if not anim.navY or math.abs(anim.navY - target) > step * #PAGES then anim.navY = target end
+    anim.navY = anim.navY + (target - anim.navY) * math.min(1, anim.dt * 14)
+    fillRect(dl, x0, anim.navY, x0 + w, anim.navY + h, u32(C.yellow, 0.13), 5)
+    fillRect(dl, x0, anim.navY + 5, x0 + 3, anim.navY + h - 5, u32(C.yellow), 2)
+
+    for i, page in ipairs(PAGES) do
+        local iy = y0 + (i - 1) * step
+        ImGui.SetCursorScreenPos(x0, iy)
+        if ImGui.InvisibleButton("##nav" .. i, w, h) then openPage(page[1]) end
+        local hovered = ImGui.IsItemHovered()
+        if hovered and i ~= selected then
+            fillRect(dl, x0, iy, x0 + w, iy + h, u32(C.panelHi, 0.55), 5)
+        end
+        ImGui.SetCursorScreenPos(x0 + em(0.8), iy + (h - ImGui.GetFontSize()) / 2)
+        local color = (i == selected) and C.yellow or (hovered and C.text or C.dim)
+        textColored(color, pageIcon(page[3]) .. page[1])
+    end
+    ImGui.SetCursorScreenPos(x0, y0 + #PAGES * step + em(0.4))
+    if dangerButton(pageIcon("Power") .. "All Off##nav", w) then
+        everythingOff()
+    end
+end
+
+local function drawPlainSidebar()
     local w = availWidth()
     -- Left-aligned labels so the icons line up.
     ImGui.PushStyleVar(ImGuiStyleVar.ButtonTextAlign, 0.08, 0.5)
@@ -3415,7 +3747,7 @@ local function drawSidebar()
         if NCT.page == name then
             primaryButton(label, w)
         elseif button(label, w) then
-            NCT.page = name
+            openPage(name)
         end
     end
     ImGui.Dummy(0, em(0.3))
@@ -3425,16 +3757,56 @@ local function drawSidebar()
     ImGui.PopStyleVar(1)
 end
 
+local function drawSidebar()
+    if not (canDraw() and pcall(drawFancySidebar)) then drawPlainSidebar() end
+end
+
+-- Status line at the bottom: the latest message, fading in when it changes.
+local function drawStatusBar()
+    local ok = NCT.toast.ok
+    local color = ok and C.green or C.red
+    local t = easeOut((os.clock() - NCT.toast.time) / 0.35)
+    local fancy = canDraw() and pcall(function()
+        local dl = ImGui.GetWindowDrawList()
+        local x, y = ImGui.GetCursorScreenPos()
+        local w = availWidth()
+        local h = ImGui.GetFontSize() + em(0.7)
+        fillRect(dl, x, y, x + w, y + h, u32(C.panel, 0.9), 5)
+        fillRect(dl, x, y, x + 3 + (1 - t) * em(2), y + h, u32(color, 0.85), 2)
+        ImGui.SetCursorScreenPos(x + em(0.9) + (1 - t) * em(1), y + em(0.35))
+        ImGui.PushStyleVar(ImGuiStyleVar.Alpha, 0.35 + 0.65 * t)
+        textColored(color, NCT.toast.text)
+        ImGui.PopStyleVar(1)
+        ImGui.SetCursorScreenPos(x, y + h + 2)
+        ImGui.Dummy(0, 0)
+    end)
+    if not fancy then wrapped(color, "> " .. NCT.toast.text) end
+end
+
 local function drawWindow()
-    ImGui.SetNextWindowSize(em(46), em(42), ImGuiCond.FirstUseEver)
+    ImGui.SetNextWindowSize(em(48), em(44), ImGuiCond.FirstUseEver)
     ImGui.SetNextWindowPos(80, 80, ImGuiCond.FirstUseEver)
 
-    if ImGui.Begin("Night City Trainer", ImGuiWindowFlags.NoCollapse) then
+    local now = os.clock()
+    anim.dt = math.min(0.1, math.max(0, now - anim.last))
+    anim.last = now
+    if anim.pageName ~= NCT.page then
+        anim.pageName = NCT.page
+        anim.pageAt = now
+    end
+
+    if ImGui.Begin("Night City Trainer", ImGuiWindowFlags.NoCollapse + ImGuiWindowFlags.NoTitleBar) then
+        if canDraw() then
+            pcall(function()
+                local wx, wy = ImGui.GetWindowPos()
+                local ww = ImGui.GetWindowSize()
+                gradientRect(ImGui.GetWindowDrawList(), wx + 8, wy, wx + ww - 8, wy + 2, u32(C.yellow), u32(C.cyan, 0.8))
+            end)
+        end
         drawHeader()
-        ImGui.Separator()
 
         local _, availH = ImGui.GetContentRegionAvail()
-        local bodyH = math.max(availH - em(2.2), em(6))
+        local bodyH = math.max(availH - em(2.6), em(6))
 
         ImGui.BeginChild("##nct_side", em(11), bodyH, true)
         drawSidebar()
@@ -3445,6 +3817,11 @@ local function drawWindow()
         ImGui.PushStyleColor(ImGuiCol.ChildBg, 0, 0, 0, 0)
         ImGui.BeginChild("##nct_page", 0, bodyH, true)
         firstSection = true
+        -- New pages fade in and slide a little from the left.
+        local t = easeOut((now - anim.pageAt) / 0.28)
+        local slide = (1 - t) * em(1.6)
+        ImGui.PushStyleVar(ImGuiStyleVar.Alpha, 0.15 + 0.85 * t)
+        if slide > 0.5 then ImGui.Indent(slide) end
         local found = false
         for _, page in ipairs(PAGES) do
             if page[1] == NCT.page then
@@ -3455,11 +3832,13 @@ local function drawWindow()
                 end
             end
         end
+        if slide > 0.5 then ImGui.Unindent(slide) end
+        ImGui.PopStyleVar(1)
         if not found then NCT.page = "Home" end
         ImGui.EndChild()
         ImGui.PopStyleColor(1)
 
-        wrapped(NCT.toast.ok and C.green or C.red, "> " .. NCT.toast.text)
+        drawStatusBar()
     end
     ImGui.End()
 end
@@ -3468,16 +3847,29 @@ end
 -- hotkeys still give feedback.
 local function drawPopup()
     local width = GetDisplayResolution()
-    ImGui.SetNextWindowPos(width / 2, 70, ImGuiCond.Always, 0.5, 0)
+    local age = os.clock() - NCT.toast.time
+    local appear = easeOut(age / 0.25)
+    local fade = 1 - math.max(0, math.min(1, (age - 2.5) / 0.5))
+    ImGui.SetNextWindowPos(width / 2, 50 + 20 * appear, ImGuiCond.Always, 0.5, 0)
     local flags = ImGuiWindowFlags.NoTitleBar + ImGuiWindowFlags.NoResize + ImGuiWindowFlags.NoMove
         + ImGuiWindowFlags.NoScrollbar + ImGuiWindowFlags.NoSavedSettings + ImGuiWindowFlags.NoInputs
         + ImGuiWindowFlags.AlwaysAutoResize + ImGuiWindowFlags.NoFocusOnAppearing
+    ImGui.PushStyleVar(ImGuiStyleVar.Alpha, math.max(0.01, appear * fade))
     if ImGui.Begin("##nct_popup", flags) then
-        textColored(C.yellow, "TRAINER")
+        if canDraw() then
+            pcall(function()
+                local wx, wy = ImGui.GetWindowPos()
+                local _, wh = ImGui.GetWindowSize()
+                fillRect(ImGui.GetWindowDrawList(), wx, wy + 6, wx + 3, wy + wh - 6,
+                    u32(NCT.toast.ok and C.green or C.red), 2)
+            end)
+        end
+        textColored(C.yellow, "NIGHT CITY TRAINER")
         ImGui.SameLine()
         textColored(NCT.toast.ok and C.green or C.red, NCT.toast.text)
     end
     ImGui.End()
+    ImGui.PopStyleVar(1)
 end
 
 ---------------------------------------------------------------------------

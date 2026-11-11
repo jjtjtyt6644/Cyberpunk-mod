@@ -10,7 +10,7 @@
 
 param(
     [string]$UpdateUrl = "https://raw.githubusercontent.com/jjtjtyt6644/Cyberpunk-mod/main/dist/version.json",
-    [string]$LauncherVersion = "1.3.0",
+    [string]$LauncherVersion = "1.4.0",
     [string]$Lua = "",      # trainer file to bundle (default: ..\NightCityTrainer\init.lua)
     [string]$OutDir = ""    # output folder (default: ..\dist)
 )
@@ -32,6 +32,11 @@ New-Item -ItemType Directory -Force $dist | Out-Null
 
 # Values baked into this build.
 $buildInfo = @"
+[assembly: System.Reflection.AssemblyVersion("$LauncherVersion")]
+[assembly: System.Reflection.AssemblyFileVersion("$LauncherVersion")]
+[assembly: System.Reflection.AssemblyTitle("Night City Trainer")]
+[assembly: System.Reflection.AssemblyProduct("Night City Trainer")]
+
 namespace NightCityTrainer
 {
     public static class BuildInfo
@@ -48,8 +53,11 @@ $fw  = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319"
 $csc = Join-Path $fw "csc.exe"
 $exe = Join-Path $dist "NightCityTrainer.exe"
 
-& $csc /nologo /target:winexe /optimize+ /platform:anycpu "/out:$exe" `
-    "/resource:$lua,init.lua" `
+$icon = Join-Path $root "icon.ico"
+if (-not (Test-Path $icon)) { & (Join-Path $root "make-icon.ps1") | Out-Null }
+
+& $csc /nologo /target:winexe /optimize+ /platform:anycpu "/out:$exe" "/win32icon:$icon" `
+    "/resource:$lua,init.lua" "/resource:$icon,icon.ico" `
     "/resource:$(Join-Path $root 'Launcher.xaml'),Launcher.xaml" `
     /r:System.dll /r:System.Core.dll /r:System.Xaml.dll /r:System.Web.Extensions.dll `
     /r:System.IO.Compression.dll /r:System.IO.Compression.FileSystem.dll /r:System.Windows.Forms.dll `
@@ -62,7 +70,8 @@ if ($LASTEXITCODE -ne 0) { throw "Build failed" }
 Copy-Item $lua (Join-Path $dist "init.lua") -Force
 $luaUrl = ""
 if ($UpdateUrl) { $luaUrl = $UpdateUrl.Substring(0, $UpdateUrl.LastIndexOf("/") + 1) + "init.lua" }
-$manifest = "{`n  `"version`": `"$trainerVersion`",`n  `"url`": `"$luaUrl`"`n}`n"
+$launcherUrl = "https://github.com/jjtjtyt6644/Cyberpunk-mod/releases/latest/download/NightCityTrainer.exe"
+$manifest = "{`n  `"version`": `"$trainerVersion`",`n  `"url`": `"$luaUrl`",`n  `"launcherVersion`": `"$LauncherVersion`",`n  `"launcherUrl`": `"$launcherUrl`"`n}`n"
 [IO.File]::WriteAllText((Join-Path $dist "version.json"), $manifest)
 
 "Built $exe"
