@@ -3,7 +3,7 @@
 -- Open the CET overlay in game to show the menu.
 
 local NCT = {
-    version = "4.1.0",
+    version = "4.2.0",
     overlayOpen = false,
     page = "Home",
     tick = 0,
@@ -33,6 +33,10 @@ local NCT = {
     blinkDistance = 10,
     flySpeed = 15,
     xpMult = 1,
+    movementOn = false, -- these four remember whether a slider setting was applied
+    cwOn = false,
+    xpOn = false,
+    speedOn = false,
     rememberCheats = true,
     showPopups = true,
 
@@ -47,6 +51,7 @@ local SAVED_FIELDS = {
     "page", "speedMult", "jumpMult", "carryBonus", "cwCapacity", "gameSpeed", "hour", "moneyAmount",
     "level", "streetCred", "attrPoints", "perkPoints", "relicPoints", "attrValue", "itemId",
     "itemQty", "matQty", "blinkDistance", "flySpeed", "xpMult", "rememberCheats", "showPopups",
+    "movementOn", "cwOn", "xpOn", "speedOn",
 }
 
 local REASON = "NightCityTrainer"
@@ -194,6 +199,32 @@ end
 ---------------------------------------------------------------------------
 -- Ammo
 ---------------------------------------------------------------------------
+
+-- Cutscenes and dialogue: the game lets players fast-forward certain scenes by
+-- holding a key. These helpers do the same without the key.
+local function sceneInterface()
+    return Game.GetSceneSystem():GetScriptInterface()
+end
+
+local function fastForwardMode()
+    for _, name in ipairs({ "GameplayReview", "Default" }) do
+        local ok, value = pcall(function() return scnFastForwardMode[name] end)
+        if ok and value ~= nil then return value end
+    end
+    error("this game version has no scene fast-forward mode")
+end
+
+local function autoSkipScenes()
+    local scenes = sceneInterface()
+    local mode = fastForwardMode()
+    if scenes:IsFastForwardingActive() then return end
+    if scenes:IsFastForwardingAllowed(mode) then scenes:FastForwardingActivate(mode) end
+end
+
+local function stopFastForward()
+    local scenes = sceneInterface()
+    if scenes:IsFastForwardingActive() then scenes:FastForwardingDeactivate() end
+end
 
 local AMMO = { "Ammo.HandgunAmmo", "Ammo.RifleAmmo", "Ammo.ShotgunAmmo", "Ammo.SniperRifleAmmo" }
 
@@ -343,19 +374,73 @@ local function playerRotation(player)
     return EulerAngles.new(0, 0, 0)
 end
 
--- The vehicle the player is sitting in, or nil when on foot.
+-- Returns the object when it really is a vehicle, otherwise nil.
+local function asVehicle(object)
+    if not object then return nil end
+    local ok, isVehicle = pcall(function() return object:IsVehicle() end)
+    if ok and isVehicle == true then return object end
+    return nil
+end
+
+-- The vehicle the player is sitting in, or nil when on foot. Several lookups
+-- are tried because the game offers more than one and not all work everywhere.
 local function mountedVehicle()
     local player = getPlayer()
-    local ok, vehicle = pcall(function() return Game["GetMountedVehicle;GameObject"](player) end)
-    if ok and vehicle then return vehicle end
-    ok, vehicle = pcall(function() return Game.GetMountedVehicle(player) end)
-    if ok and vehicle then return vehicle end
+    if not player then return nil end
+
+    local lookups = {
+        function()
+            local info = Game.GetMountingFacility():GetMountingInfoSingleWithObjects(player)
+            return Game.FindEntityByID(info.parentId)
+        end,
+        function() return Game.GetMountedVehicle(player) end,
+        function() return GetMountedVehicle(player) end,
+        function()
+            local found, vehicle = VehicleComponent.GetVehicle(Game.GetGameInstance(), player)
+            return found and vehicle or nil
+        end,
+    }
+    for _, lookup in ipairs(lookups) do
+        local ok, object = pcall(lookup)
+        local vehicle = ok and asVehicle(object) or nil
+        if vehicle then return vehicle end
+    end
+    return nil
+end
+
+-- The vehicle the player is aiming at, or nil.
+local function lookedAtVehicle()
+    local ok, object = pcall(function()
+        return Game.GetTargetingSystem():GetLookAtObject(getPlayer(), false, false)
+    end)
+    return ok and asVehicle(object) or nil
+end
+
+-- The personal vehicle most recently called, or nil.
+local function calledVehicle()
+    local ok, object = pcall(function() return Game.GetVehicleSystem():GetActivePlayerVehicle() end)
+    local vehicle = ok and asVehicle(object) or nil
+    if vehicle then return vehicle end
+    ok, object = pcall(function() return Game.GetVehicleSystem():GetActivePlayerVehicle(0) end)
+    return ok and asVehicle(object) or nil
+end
+
+-- Finds the vehicle the vehicle buttons should act on, and says how it was found.
+local function findVehicle()
+    local vehicle = mountedVehicle()
+    if vehicle then return vehicle, "the vehicle you are in" end
+    vehicle = lookedAtVehicle()
+    if vehicle then return vehicle, "the vehicle you are looking at" end
+    vehicle = calledVehicle()
+    if vehicle then return vehicle, "your last called vehicle" end
     return nil
 end
 
 local function requireVehicle()
-    local vehicle = mountedVehicle()
-    if not vehicle then error("get in a vehicle first") end
+    local vehicle = findVehicle()
+    if not vehicle then
+        error("no vehicle found - get in one, look at one, or call your car first")
+    end
     return vehicle
 end
 
@@ -376,18 +461,18 @@ end
 -- Vehicles
 ---------------------------------------------------------------------------
 
+-- Repairs body, glass and health. Each part is tried separately; it only fails
+-- when none of them worked.
 local function repairVehicle(vehicle)
-    local repaired = false
-    if pcall(function() vehicle:GetVehicleComponent():RepairVehicle() end) then repaired = true end
+    local steps = 0
+    if pcall(function() vehicle:GetVehicleComponent():RepairVehicle() end) then steps = steps + 1 end
+    if pcall(function() vehicle:DestructionResetGrid() end) then steps = steps + 1 end
+    if pcall(function() vehicle:DestructionResetGlass() end) then steps = steps + 1 end
     if pcall(function()
-        vehicle:DestructionResetGrid()
-        vehicle:DestructionResetGlass()
-    end) then repaired = true end
-    pcall(function()
         Game.GetStatPoolsSystem():RequestSettingStatPoolMaxValue(vehicle:GetEntityID(),
             gamedataStatPoolType.Health, nil)
-    end)
-    if not repaired then error("this vehicle could not be repaired") end
+    end) then steps = steps + 1 end
+    if steps == 0 then error("the game would not repair this vehicle") end
 end
 
 local function setVehicleGodMode(vehicle, enabled)
@@ -402,7 +487,7 @@ end
 
 -- Keeps whatever vehicle the player is driving undamaged.
 local function protectVehicle()
-    local vehicle = mountedVehicle()
+    local vehicle = mountedVehicle() or calledVehicle()
     if not vehicle then return end
     pcall(setVehicleGodMode, vehicle, true)
     pcall(repairVehicle, vehicle)
@@ -561,6 +646,17 @@ local CHEATS = {
         desc = "The in-game clock stops, so it stays day or night.",
         apply = function(on) Game.GetTimeSystem():SetPausedState(on, CName.new(REASON)) end,
     },
+    autoSkip = {
+        label = "Auto Skip Cutscenes",
+        desc = "Fast-forwards cutscenes and dialogue the game lets you skip, as if holding the skip key.",
+        apply = function(on)
+            -- Fail loudly now if this game version has no scene fast-forward.
+            sceneInterface()
+            fastForwardMode()
+            if on then return "Auto Skip ON - scenes the game allows skipping will fast-forward" end
+            stopFastForward()
+        end,
+    },
     infAmmo = {
         label = "Infinite Ammo", remember = true,
         desc = "Weapons stop using ammo and your reserve is kept topped up.",
@@ -623,7 +719,12 @@ local CHEATS = {
     },
 }
 
-for key in pairs(CHEATS) do NCT[key] = false end
+-- Every cheat is remembered between sessions except Fly Mode, which would
+-- drop you from the sky after loading.
+for key, cheat in pairs(CHEATS) do
+    NCT[key] = false
+    if cheat.remember == nil then cheat.remember = key ~= "fly" end
+end
 
 local function setCheat(key, on)
     local cheat = CHEATS[key]
@@ -644,9 +745,46 @@ end
 
 local function resetMovement()
     NCT.speedMult, NCT.jumpMult, NCT.carryBonus = 1.0, 1.0, 0
+    NCT.movementOn = false
     setStatMod("speed")
     setStatMod("jump")
     setStatMod("carry")
+end
+
+local function applyMovement()
+    setStatMod("speed", gamedataStatType.MaxSpeed, gameStatModifierType.Multiplier,
+        NCT.speedMult > 1.0 and NCT.speedMult or nil)
+    setStatMod("jump", gamedataStatType.JumpHeight, gameStatModifierType.Multiplier,
+        NCT.jumpMult > 1.0 and NCT.jumpMult or nil)
+    setStatMod("carry", gamedataStatType.CarryCapacity, gameStatModifierType.Additive,
+        NCT.carryBonus > 0 and NCT.carryBonus or nil)
+    NCT.movementOn = NCT.speedMult > 1.0 or NCT.jumpMult > 1.0 or NCT.carryBonus > 0
+end
+
+local function applyCyberwareCapacity()
+    setStatMod("cwCapacity", gamedataStatType.Humanity, gameStatModifierType.Additive,
+        NCT.cwCapacity > 0 and NCT.cwCapacity or nil)
+    NCT.cwOn = NCT.cwCapacity > 0
+end
+
+local function applyXpMultiplier()
+    setStatMod("xpMult", gamedataStatType.XPbonusMultiplier, gameStatModifierType.Additive,
+        NCT.xpMult > 1 and (NCT.xpMult - 1) or nil)
+    NCT.xpOn = NCT.xpMult > 1
+end
+
+local function applyGameSpeed(speed)
+    NCT.gameSpeed = speed
+    NCT.speedOn = math.abs(speed - 1.0) > 0.01
+    setGameSpeed(speed)
+end
+
+-- Re-applies every slider setting that was switched on, e.g. after a restart.
+local function applyNumericSettings()
+    if NCT.movementOn then pcall(applyMovement) end
+    if NCT.cwOn then pcall(applyCyberwareCapacity) end
+    if NCT.xpOn then pcall(applyXpMultiplier) end
+    if NCT.speedOn then pcall(setGameSpeed, NCT.gameSpeed) end
 end
 
 local function everythingOff()
@@ -663,15 +801,12 @@ local function everythingOff()
     pcall(resetMovement)
     pcall(function()
         NCT.cwCapacity = 0
-        setStatMod("cwCapacity")
+        applyCyberwareCapacity()
     end)
-    pcall(function()
-        NCT.gameSpeed = 1.0
-        setGameSpeed(1.0)
-    end)
+    pcall(function() applyGameSpeed(1.0) end)
     pcall(function()
         NCT.xpMult = 1
-        setStatMod("xpMult")
+        applyXpMultiplier()
     end)
     toast("Every cheat switched off", true)
 end
@@ -706,17 +841,27 @@ end
 -- Settings file (kept next to this script)
 ---------------------------------------------------------------------------
 
+-- Writes every setting and active cheat to disk, but only when something
+-- changed since the last write. Called every few seconds, when the menu
+-- closes and when the game shuts down, so nothing is lost on a crash.
 local function saveSettings()
     local data = { spots = NCT.spots, active = {} }
     for _, field in ipairs(SAVED_FIELDS) do data[field] = NCT[field] end
+    local keys = {}
     for key, cheat in pairs(CHEATS) do
-        if cheat.remember and NCT[key] then data.active[#data.active + 1] = key end
+        if cheat.remember and NCT[key] then keys[#keys + 1] = key end
     end
+    table.sort(keys)
+    data.active = keys
+
+    local ok, text = pcall(json.encode, data)
+    if not ok or text == NCT.lastSaved then return end
     pcall(function()
         local file = io.open("settings.json", "w")
         if file then
-            file:write(json.encode(data))
+            file:write(text)
             file:close()
+            NCT.lastSaved = text
         end
     end)
 end
@@ -744,14 +889,18 @@ local function loadSettings()
             end
         end
     end
-    if NCT.rememberCheats and type(data.active) == "table" and #data.active > 0 then
-        NCT.pendingRestore = data.active
+    if NCT.rememberCheats then
+        NCT.pendingRestore = type(data.active) == "table" and data.active or {}
+    else
+        NCT.movementOn, NCT.cwOn, NCT.xpOn, NCT.speedOn = false, false, false, false
     end
 end
 
--- Switches remembered cheats back on once a save is loaded.
+-- Switches remembered cheats and slider settings back on once a save is
+-- loaded. Anything the game isn't ready for yet is retried a few times.
 local function restoreCheats()
-    local restored = 0
+    NCT.restoreTries = (NCT.restoreTries or 0) + 1
+    local restored, remaining = 0, {}
     for _, key in ipairs(NCT.pendingRestore) do
         local cheat = CHEATS[key]
         if cheat and cheat.remember and not NCT[key] then
@@ -760,13 +909,37 @@ local function restoreCheats()
             if ok then
                 NCT[key] = true
                 restored = restored + 1
+            else
+                remaining[#remaining + 1] = key
             end
         end
     end
-    NCT.pendingRestore = nil
+    applyNumericSettings()
+    if #remaining > 0 and NCT.restoreTries < 6 then
+        NCT.pendingRestore = remaining
+    else
+        NCT.pendingRestore = nil
+        NCT.restoreTries = 0
+    end
     if restored > 0 then
         toast("Restored " .. restored .. " cheat" .. (restored == 1 and "" or "s") .. " from last session", true)
     end
+end
+
+-- Loading another save creates a new player and wipes every stat change, so
+-- everything that was on is queued to be switched on again.
+local function onNewSave()
+    local keys = {}
+    for key in pairs(CHEATS) do
+        if NCT[key] then
+            keys[#keys + 1] = key
+            NCT[key] = false
+        end
+    end
+    NCT.mods = {}
+    NCT.flyPos = nil
+    NCT.restoreTries = 0
+    NCT.pendingRestore = keys
 end
 
 ---------------------------------------------------------------------------
@@ -1158,14 +1331,7 @@ local function drawPlayerPage()
 
     local w = columnWidth(2)
     if primaryButton("APPLY MOVEMENT", w) then
-        run("Movement applied", function()
-            setStatMod("speed", gamedataStatType.MaxSpeed, gameStatModifierType.Multiplier,
-                NCT.speedMult > 1.0 and NCT.speedMult or nil)
-            setStatMod("jump", gamedataStatType.JumpHeight, gameStatModifierType.Multiplier,
-                NCT.jumpMult > 1.0 and NCT.jumpMult or nil)
-            setStatMod("carry", gamedataStatType.CarryCapacity, gameStatModifierType.Additive,
-                NCT.carryBonus > 0 and NCT.carryBonus or nil)
-        end)
+        run("Movement applied", applyMovement)
     end
     ImGui.SameLine()
     if button("Reset Movement", w) then
@@ -1214,10 +1380,7 @@ local function drawCombatPage()
     local apply
     NCT.cwCapacity, apply = sliderInt("cw", "Extra cyberware capacity", NCT.cwCapacity, 0, 1000, "SET")
     if apply then
-        run("Cyberware capacity +" .. NCT.cwCapacity, function()
-            setStatMod("cwCapacity", gamedataStatType.Humanity, gameStatModifierType.Additive,
-                NCT.cwCapacity > 0 and NCT.cwCapacity or nil)
-        end)
+        run("Cyberware capacity +" .. NCT.cwCapacity, applyCyberwareCapacity)
     end
     hint("Turn damage, armor and cyberware cheats off before saving if you want a clean save.")
 end
@@ -1338,10 +1501,7 @@ local function drawProgressPage()
     section("Experience")
     NCT.xpMult, apply = sliderInt("xpmult", "XP multiplier for everything you earn", NCT.xpMult, 1, 20, "SET")
     if apply then
-        run("XP multiplier x" .. NCT.xpMult, function()
-            setStatMod("xpMult", gamedataStatType.XPbonusMultiplier, gameStatModifierType.Additive,
-                NCT.xpMult > 1 and (NCT.xpMult - 1) or nil)
-        end)
+        run("XP multiplier x" .. NCT.xpMult, applyXpMultiplier)
     end
     local xw = columnWidth(2)
     if button("+10,000 XP", xw) then
@@ -1526,14 +1686,19 @@ local function drawWorldPage()
     end
     cheatToggle("freezeClock")
 
+    section("Cutscenes")
+    cheatToggle("autoSkip")
+    hint("Works on scenes the game normally lets you fast-forward by holding a key. "
+        .. "Scenes it does not allow skipping still play.")
+
     NCT.gameSpeed, apply = sliderFloat("gspeed", "Game speed", NCT.gameSpeed, 0.1, 3.0, "x%.2f", "SET")
     if apply then
         NCT.slowMo = false
-        run(string.format("Game speed x%.2f", NCT.gameSpeed), function() setGameSpeed(NCT.gameSpeed) end)
+        run(string.format("Game speed x%.2f", NCT.gameSpeed), function() applyGameSpeed(NCT.gameSpeed) end)
     end
     if button("Back To Normal Speed", availWidth()) then
-        NCT.gameSpeed, NCT.slowMo = 1.0, false
-        run("Game speed normal", function() setGameSpeed(1.0) end)
+        NCT.slowMo = false
+        run("Game speed normal", function() applyGameSpeed(1.0) end)
     end
 
     section("Weather")
@@ -1857,11 +2022,12 @@ local HERO_VEHICLES = {
 
 local function drawVehiclesPage()
     section("Current Vehicle")
-    local inVehicle = getPlayer() and mountedVehicle() ~= nil
-    if inVehicle then
-        textColored(C.green, "You are in a vehicle.")
+    local _, source = nil, nil
+    if getPlayer() then _, source = findVehicle() end
+    if source then
+        textColored(C.green, "The buttons below act on " .. source .. ".")
     else
-        hint("Get in a vehicle to use the buttons in this section.")
+        hint("No vehicle found. Get in one, look at one, or call your car, then use the buttons below.")
     end
 
     cheatToggle("carGod", "Indestructible Vehicle  (auto-repairs)")
@@ -1889,7 +2055,7 @@ local function drawVehiclesPage()
     ImGui.SameLine()
     if button("Boost Forward", w) then
         run("Boosted " .. NCT.blinkDistance .. "m forward", function()
-            requireVehicle()
+            if not mountedVehicle() then error("get in the vehicle to boost it") end
             blink(NCT.blinkDistance)
         end)
     end
@@ -2017,7 +2183,7 @@ local HOTKEY_HELP = {
     "Add E$ 100,000", "Heal to full", "Refill ammo", "Clear wanted level",
     "Toggle God Mode", "Toggle Infinite Ammo", "Toggle Slow Motion", "Toggle Fly Mode",
     "Toggle Indestructible Vehicle", "Repair vehicle", "Flip vehicle upright",
-    "Kill hostile enemies nearby",
+    "Kill hostile enemies nearby", "Toggle Auto Skip Cutscenes",
     "Blink forward", "Teleport to first saved spot", "Turn every cheat off",
     "Fly: forward / back / up / down  (hold)",
 }
@@ -2029,8 +2195,9 @@ local function drawSettingsPage()
         NCT.rememberCheats = v
         saveSettings()
     end
-    hint("God mode, infinite stamina, oxygen, RAM and ammo, and disabled police switch back on "
-        .. "automatically when you load a save.")
+    hint("Every setting is saved automatically as you change it. Every cheat you left on, plus your "
+        .. "movement, cyberware, XP and game speed sliders, switch back on when you load a save. "
+        .. "Only Fly Mode is left off on purpose.")
 
     v, changed = ImGui.Checkbox("Show pop-ups when I use a hotkey", NCT.showPopups)
     if changed then
@@ -2038,6 +2205,9 @@ local function drawSettingsPage()
         saveSettings()
     end
     hint("A small message appears at the top of the screen while the menu is closed.")
+
+    section("Quality Of Life")
+    cheatToggle("autoSkip")
 
     section("Panic Button")
     if dangerButton("TURN EVERY CHEAT OFF", availWidth()) then
@@ -2204,13 +2374,31 @@ registerForEvent("onUpdate", function(delta)
     NCT.tick = NCT.tick + delta
     NCT.infoTick = NCT.infoTick + delta
     NCT.slowTick = NCT.slowTick + delta
+    NCT.saveTick = (NCT.saveTick or 0) + delta
 
     if NCT.fly then pcall(updateFly, delta) end
     pcall(stepShopBuild)
     pcall(stepBulk)
 
+    if NCT.saveTick >= 5 then
+        NCT.saveTick = 0
+        saveSettings()
+    end
+
     if NCT.tick >= 0.2 then
         NCT.tick = 0
+
+        -- Spot a save being loaded: the player disappears, then comes back.
+        local present = getPlayer() ~= nil
+        if present and not NCT.hadPlayer then
+            NCT.hadPlayer = true
+            if NCT.seenPlayer then onNewSave() end
+            NCT.seenPlayer = true
+        elseif not present then
+            NCT.hadPlayer = false
+        end
+
+        if NCT.autoSkip and present then pcall(autoSkipScenes) end
         if (NCT.infStamina or NCT.infOxygen or NCT.infRam) and getPlayer() then
             pcall(function()
                 if NCT.infStamina then fillPool(gamedataStatPoolType.Stamina) end
@@ -2286,6 +2474,7 @@ cheatHotkey("nct_inf_ammo", "infAmmo")
 cheatHotkey("nct_slow_mo", "slowMo")
 cheatHotkey("nct_fly", "fly")
 cheatHotkey("nct_car_god", "carGod")
+cheatHotkey("nct_auto_skip", "autoSkip")
 
 registerHotkey("nct_repair_vehicle", "Repair vehicle", function()
     run("Vehicle repaired", function() repairVehicle(requireVehicle()) end)
