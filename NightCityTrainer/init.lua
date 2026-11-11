@@ -3,7 +3,7 @@
 -- Open the CET overlay in game to show the menu.
 
 local NCT = {
-    version = "4.4.0",
+    version = "4.5.0",
     overlayOpen = false,
     page = "Home",
     tick = 0,
@@ -33,6 +33,9 @@ local NCT = {
     blinkDistance = 10,
     flySpeed = 15,
     xpMult = 1,
+    lootRadius = 15,    -- metres around the player that Auto Loot reaches
+    looted = {},        -- bodies already looted, so each is only emptied once
+    hitHooked = false,  -- set once the one-hit-kill damage hook was accepted
     skipSpeed = 2,      -- how fast the skip helper presses: 1 balanced, 2 fast, 3 insane
     fovValue = 80,
     fovOn = false,
@@ -48,7 +51,7 @@ local NCT = {
     achConfirm = false,
     mods = {},   -- active stat modifiers, by key
     spots = {},  -- saved teleport positions
-    keys = { fwd = false, back = false, up = false, down = false },
+    keys = { fwd = false, back = false, left = false, right = false, up = false, down = false },
     flyPos = nil,
 }
 
@@ -57,6 +60,7 @@ local SAVED_FIELDS = {
     "level", "streetCred", "attrPoints", "perkPoints", "relicPoints", "attrValue", "itemId",
     "itemQty", "matQty", "blinkDistance", "flySpeed", "xpMult", "rememberCheats", "showPopups",
     "movementOn", "cwOn", "xpOn", "speedOn", "skipSpeed", "fovValue", "fovOn", "fovDefault",
+    "lootRadius",
 }
 
 local REASON = "NightCityTrainer"
@@ -153,7 +157,8 @@ local function setStatMod(key, statType, modType, value)
     local stats = Game.GetStatsSystem()
     local id = getPlayer():GetEntityID()
     if NCT.mods[key] then
-        stats:RemoveModifier(id, NCT.mods[key])
+        -- After a death or a loaded save the old modifier no longer exists; that is fine.
+        pcall(function() stats:RemoveModifier(id, NCT.mods[key]) end)
         NCT.mods[key] = nil
     end
     if value then
@@ -163,14 +168,17 @@ local function setStatMod(key, statType, modType, value)
     end
 end
 
+-- Invulnerable blocks damage; Immortal is a second safety net that never lets
+-- health reach zero, which covers explosions and other damage that slips past.
 local function setGodMode(enabled)
     local gm = Game.GetGodModeSystem()
     local id = getPlayer():GetEntityID()
     local reason = CName.new(REASON)
-    if enabled then
-        gm:AddGodMode(id, gameGodModeType.Invulnerable, reason)
-    else
-        gm:RemoveGodMode(id, gameGodModeType.Invulnerable, reason)
+    for _, kind in ipairs({ "Invulnerable", "Immortal" }) do
+        pcall(function()
+            local mode = gameGodModeType[kind]
+            if enabled then gm:AddGodMode(id, mode, reason) else gm:RemoveGodMode(id, mode, reason) end
+        end)
     end
 end
 
@@ -249,14 +257,32 @@ local function sceneTier()
     return board:GetInt(defs.PlayerStateMachine.SceneTier)
 end
 
--- True while a cutscene or dialogue scene is playing.
+-- True while the "hold to skip" prompt is on screen. This is the most exact
+-- signal there is, because it is the same flag the game's own HUD uses.
+local function skipPromptShown()
+    local defs = Game.GetAllBlackboardDefs()
+    local board = Game.GetBlackboardSystem():Get(defs.UI_FastForward)
+    return board:GetBool(defs.UI_FastForward.FastForwardHintActive) == true
+end
+
+-- True while a cutscene or dialogue scene is playing. A scene counts when the
+-- skip prompt is showing, or the game is in a cinematic state. What was seen is
+-- kept in NCT.sceneInfo so the menu can show it.
 local function inScene()
-    local ok, tier = pcall(sceneTier)
-    if ok and type(tier) == "number" then return tier >= 3 end
-    local allowedOk, allowed = pcall(function()
+    local info = {}
+    local okPrompt, prompt = pcall(skipPromptShown)
+    if okPrompt then info.prompt = prompt end
+    local okTier, tier = pcall(sceneTier)
+    if okTier and type(tier) == "number" then info.tier = tier end
+    local okAllowed, allowed = pcall(function()
         return sceneInterface():IsFastForwardingAllowed(fastForwardMode())
     end)
-    return allowedOk and allowed == true
+    if okAllowed then info.allowed = allowed == true end
+    NCT.sceneInfo = info
+
+    if info.prompt then return true end
+    if info.tier then return info.tier >= 3 end
+    return info.allowed == true
 end
 
 -- The launcher's skip helper presses the skip key for us, because Cyber Engine
@@ -282,6 +308,94 @@ local function skipHelperRunning()
     end)
     local stamp = ok and text and tonumber(text:match("%d+"))
     return stamp ~= nil and stamp ~= false and math.abs(os.time() - stamp) <= 4
+end
+
+---------------------------------------------------------------------------
+-- Combat helpers: one-hit kill, fall guard, auto loot
+---------------------------------------------------------------------------
+
+local function poolValue(entityId, pool)
+    return Game.GetStatPoolsSystem():GetStatPoolValue(entityId, pool, false)
+end
+
+local function setPoolValue(entityId, pool, value)
+    Game.GetStatPoolsSystem():RequestSettingStatPoolValue(entityId, pool, value, nil)
+end
+
+-- Runs when anything is hit. With One-Hit Kill on, hostile enemies that the
+-- player hits die on the spot. Everything is guarded: a hook that throws
+-- would otherwise show up in every fight.
+local function onNpcHit(npc, hit)
+    if not NCT.oneHit then return end
+    pcall(function()
+        local player = getPlayer()
+        if not player then return end
+        local attacker = hit.attackData:GetInstigator()
+        if not attacker or not attacker:IsPlayer() then return end
+        if npc:IsDead() then return end
+        if GameObject.GetAttitudeTowards(npc, player) ~= EAIAttitude.AIA_Hostile then return end
+        if not pcall(function() npc:Kill(player, false, false) end) then
+            setPoolValue(npc:GetEntityID(), gamedataStatPoolType.Health, 0)
+        end
+    end)
+end
+
+-- Registers the damage hook once. Returns true when the game accepted it.
+local function hookHits()
+    for _, className in ipairs({ "NPCPuppet", "ScriptedPuppet" }) do
+        local ok = pcall(function()
+            Observe(className, "OnHitEvent", function(self, hit) onNpcHit(self, hit) end)
+        end)
+        if ok then return true end
+    end
+    return false
+end
+
+-- Fall guard: when the player has just been falling fast and health suddenly
+-- drops, the lost health is put back. Runs about 20 times a second.
+local function guardFalls()
+    local player = getPlayer()
+    if not player then return end
+    local id = player:GetEntityID()
+    local now = os.clock()
+    local hp = poolValue(id, gamedataStatPoolType.Health)
+    local z = player:GetWorldPosition().z
+    local last = NCT.fall
+    local airUntil = last and last.airUntil or 0
+    if last then
+        local speed = (last.z - z) / math.max(now - last.time, 0.001)
+        if speed > 6 then airUntil = now + 1.0 end
+        if hp < last.hp - 0.5 and now < airUntil + 0.3 then
+            pcall(setPoolValue, id, gamedataStatPoolType.Health, last.hp)
+            hp = last.hp
+        end
+    end
+    NCT.fall = { hp = hp, z = z, time = now, airUntil = airUntil }
+end
+
+-- Auto loot: takes everything from dead enemies close to the player, once each.
+local function autoLootNearby()
+    local player = getPlayer()
+    local npcs = player:GetNPCsAroundObject(NCT.lootRadius)
+    local taken = 0
+    local seen = NCT.looted
+    local ts = Game.GetTransactionSystem()
+    for _, npc in ipairs(npcs) do
+        local ok, dead = pcall(function() return npc:IsDead() end)
+        if ok and dead then
+            local id = tostring(npc:GetEntityID().hash)
+            if not seen[id] then
+                seen[id] = os.clock()
+                if pcall(function() ts:TransferAllItems(npc, player) end) then taken = taken + 1 end
+            end
+        end
+    end
+    -- Forget old bodies so the list cannot grow forever.
+    local now = os.clock()
+    for id, when in pairs(seen) do
+        if now - when > 120 then seen[id] = nil end
+    end
+    return taken
 end
 
 local AMMO = { "Ammo.HandgunAmmo", "Ammo.RifleAmmo", "Ammo.ShotgunAmmo", "Ammo.SniperRifleAmmo" }
@@ -446,6 +560,11 @@ local function mountedVehicle()
     local player = getPlayer()
     if not player then return nil end
 
+    -- The answer is reused for a moment: it is asked for many times a second
+    -- while flying, and the lookups are not free.
+    local cache = NCT.mountCache
+    if cache and os.clock() - cache.time < 0.3 then return cache.vehicle end
+
     local lookups = {
         function()
             local info = Game.GetMountingFacility():GetMountingInfoSingleWithObjects(player)
@@ -453,17 +572,15 @@ local function mountedVehicle()
         end,
         function() return Game.GetMountedVehicle(player) end,
         function() return GetMountedVehicle(player) end,
-        function()
-            local found, vehicle = VehicleComponent.GetVehicle(Game.GetGameInstance(), player)
-            return found and vehicle or nil
-        end,
     }
+    local found = nil
     for _, lookup in ipairs(lookups) do
         local ok, object = pcall(lookup)
-        local vehicle = ok and asVehicle(object) or nil
-        if vehicle then return vehicle end
+        found = ok and asVehicle(object) or nil
+        if found then break end
     end
-    return nil
+    NCT.mountCache = { time = os.clock(), vehicle = found }
+    return found
 end
 
 -- The vehicle the player is aiming at, or nil.
@@ -519,38 +636,6 @@ end
 -- Vehicles
 ---------------------------------------------------------------------------
 
--- Repairs body, glass and health. Each part is tried separately; it only fails
--- when none of them worked.
-local function repairVehicle(vehicle)
-    local steps = 0
-    if pcall(function() vehicle:GetVehicleComponent():RepairVehicle() end) then steps = steps + 1 end
-    if pcall(function() vehicle:DestructionResetGrid() end) then steps = steps + 1 end
-    if pcall(function() vehicle:DestructionResetGlass() end) then steps = steps + 1 end
-    if pcall(function()
-        Game.GetStatPoolsSystem():RequestSettingStatPoolMaxValue(vehicle:GetEntityID(),
-            gamedataStatPoolType.Health, nil)
-    end) then steps = steps + 1 end
-    if steps == 0 then error("the game would not repair this vehicle") end
-end
-
-local function setVehicleGodMode(vehicle, enabled)
-    local gm = Game.GetGodModeSystem()
-    local reason = CName.new(REASON)
-    if enabled then
-        gm:AddGodMode(vehicle:GetEntityID(), gameGodModeType.Invulnerable, reason)
-    else
-        gm:RemoveGodMode(vehicle:GetEntityID(), gameGodModeType.Invulnerable, reason)
-    end
-end
-
--- Keeps whatever vehicle the player is driving undamaged.
-local function protectVehicle()
-    local vehicle = mountedVehicle() or calledVehicle()
-    if not vehicle then return end
-    pcall(setVehicleGodMode, vehicle, true)
-    pcall(repairVehicle, vehicle)
-end
-
 local function flipVehicle()
     local vehicle = requireVehicle()
     local pos = vehicle:GetWorldPosition()
@@ -593,8 +678,9 @@ local function killHostiles(range)
     return killed
 end
 
--- Fly mode: holds the player in the air and moves them along the camera
--- direction while the bound fly keys are held.
+-- Fly mode: holds the player in the air and steers them with the camera. Forward
+-- and back follow where the camera points, left and right strafe across it, and
+-- up and down move straight along the vertical.
 local function updateFly(delta)
     local player = getPlayer()
     if not player then return end
@@ -604,12 +690,22 @@ local function updateFly(delta)
     end
     local p, k = NCT.flyPos, NCT.keys
     local step = NCT.flySpeed * delta
-    if k.fwd or k.back then
+    local moving = k.fwd or k.back or k.left or k.right
+    if moving then
         local dir = Game.GetCameraSystem():GetActiveCameraForward()
-        local sign = k.fwd and 1 or -1
-        p.x = p.x + dir.x * step * sign
-        p.y = p.y + dir.y * step * sign
-        p.z = p.z + dir.z * step * sign
+        local forward = (k.fwd and 1 or 0) - (k.back and 1 or 0)
+        local side = (k.right and 1 or 0) - (k.left and 1 or 0)
+        -- The right-hand direction is the camera direction turned 90 degrees, flat on the ground.
+        local flat = math.sqrt(dir.x * dir.x + dir.y * dir.y)
+        local rx, ry = 0, 0
+        if flat > 0.001 then rx, ry = dir.y / flat, -dir.x / flat end
+        local mx = dir.x * forward + rx * side
+        local my = dir.y * forward + ry * side
+        local mz = dir.z * forward
+        -- Moving diagonally is not faster than moving straight.
+        local length = math.sqrt(mx * mx + my * my + mz * mz)
+        if length > 1 then mx, my, mz = mx / length, my / length, mz / length end
+        p.x, p.y, p.z = p.x + mx * step, p.y + my * step, p.z + mz * step
     end
     if k.up then p.z = p.z + step end
     if k.down then p.z = p.z - step end
@@ -640,10 +736,23 @@ local function multiStatCheat(key, stats)
     end
 end
 
+-- God mode's extra layer: maximum resistance to every damage type, explosions included.
+local godResistance = multiStatCheat("godResist", {
+    { "ExplosionResistance", "Additive", 100 },
+    { "PhysicalResistance", "Additive", 100 },
+    { "ThermalResistance", "Additive", 100 },
+    { "ElectricResistance", "Additive", 100 },
+    { "ChemicalResistance", "Additive", 100 },
+})
+
 local CHEATS = {
     godMode = {
-        label = "God Mode", remember = true, apply = setGodMode,
-        desc = "You take no damage from anything.",
+        label = "God Mode", remember = true,
+        apply = function(on)
+            setGodMode(on)
+            pcall(godResistance, on)
+        end,
+        desc = "You take no damage from anything, explosions included, and your health is topped up constantly.",
     },
     infStamina = {
         label = "Infinite Stamina", remember = true,
@@ -694,10 +803,18 @@ local CHEATS = {
             { "CanLandSilently", "Additive", 1 },
         }),
     },
-    headshots = {
-        label = "Lethal Headshots",
-        desc = "Headshots deal massively increased damage.",
-        apply = statCheat("headshots", "HeadshotDamageMultiplier", "Additive", 10),
+    oneHit = {
+        label = "One-Hit Kill",
+        desc = "Any hit you land on a hostile enemy kills them instantly.",
+        apply = function(on)
+            if on and not NCT.hitHooked then
+                error("could not hook into the game's damage events on this version")
+            end
+        end,
+    },
+    autoLoot = {
+        label = "Auto Loot",
+        desc = "Automatically takes everything from enemies you have killed nearby.",
     },
     perfectAim = {
         label = "Perfect Aim",
@@ -769,8 +886,12 @@ local CHEATS = {
         desc = "Crimes no longer raise a wanted level.",
     },
     noFall = {
-        label = "No Fall Damage", apply = statCheat("noFall", "FallDamageReduction", "Additive", 100),
-        desc = "Drop from any height without getting hurt.",
+        label = "No Fall Damage",
+        apply = multiStatCheat("noFall", {
+            { "FallDamageReduction", "Additive", 100 },
+            { "HasSuperheroFall", "Additive", 1 },
+        }),
+        desc = "Drop from any height without getting hurt. A watchdog also undoes any health lost in a fall.",
     },
     alwaysCrit = {
         label = "Always Crit", apply = statCheat("alwaysCrit", "CritChance", "Additive", 100),
@@ -791,18 +912,6 @@ local CHEATS = {
     slowMo = {
         label = "Slow Motion", apply = function(on) setGameSpeed(on and 0.25 or 1.0) end,
         desc = "The world runs at quarter speed.",
-    },
-    carGod = {
-        label = "Indestructible Vehicle", remember = true,
-        desc = "The vehicle you drive takes no damage and repairs itself.",
-        apply = function(on)
-            if on then
-                protectVehicle()
-            else
-                local vehicle = mountedVehicle()
-                if vehicle then setVehicleGodMode(vehicle, false) end
-            end
-        end,
     },
     fly = {
         label = "Fly Mode",
@@ -932,8 +1041,8 @@ local LOADOUTS = {
         { "invisible", "silent", "noPolice" } },
     { "PARKOUR", "Double jump, air dash, endless stamina, no fall damage.",
         { "doubleJump", "airDash", "noFall", "infStamina" } },
-    { "SOLO", "Perfect aim, guaranteed crits, lethal headshots and endless ammo.",
-        { "perfectAim", "alwaysCrit", "megaCrit", "headshots", "infAmmo" } },
+    { "SOLO", "Perfect aim, guaranteed crits, one-hit kills and endless ammo.",
+        { "perfectAim", "alwaysCrit", "megaCrit", "oneHit", "infAmmo" } },
     { "NETRUNNER", "Free instant quickhacks, endless RAM and fast item recharge.",
         { "instantHacks", "infRam", "rapidRecharge" } },
 }
@@ -1107,17 +1216,41 @@ end
 -- Loading another save creates a new player and wipes every stat change, so
 -- everything that was on is queued to be switched on again.
 local function onNewSave()
-    local keys = {}
+    -- Keep anything already waiting: a death and the reload after it both call this.
+    local keys, queued = {}, {}
+    for _, key in ipairs(NCT.pendingRestore or {}) do
+        keys[#keys + 1] = key
+        queued[key] = true
+    end
     for key in pairs(CHEATS) do
         if NCT[key] then
-            keys[#keys + 1] = key
+            if not queued[key] then keys[#keys + 1] = key end
             NCT[key] = false
         end
     end
     NCT.mods = {}
     NCT.flyPos = nil
+    NCT.fall = nil
+    NCT.mountCache = nil
     NCT.restoreTries = 0
     NCT.pendingRestore = keys
+end
+
+-- Stat-based cheats are re-applied every few seconds, so if the game ever drops
+-- a modifier (a respawn, a scripted scene) it comes straight back.
+local function reassertStatCheats()
+    for key, cheat in pairs(CHEATS) do
+        if NCT[key] and cheat.apply then
+            local owned = false
+            for modKey in pairs(NCT.mods) do
+                if modKey:sub(1, #key) == key then
+                    owned = true
+                    break
+                end
+            end
+            if owned then pcall(cheat.apply, true) end
+        end
+    end
 end
 
 ---------------------------------------------------------------------------
@@ -1456,8 +1589,8 @@ local function drawHomePage()
         run("Wanted level cleared", clearWanted)
     end
     ImGui.SameLine()
-    if button("Repair Vehicle", w) then
-        run("Vehicle repaired", function() repairVehicle(requireVehicle()) end)
+    if button("Summon Vehicle", w) then
+        run("Vehicle summoned", function() Game.GetVehicleSystem():SpawnPlayerVehicle() end)
     end
 
     section("Profiles")
@@ -1589,7 +1722,12 @@ local function drawCombatPage()
     section("Damage")
     cheatToggle("alwaysCrit")
     cheatToggle("megaCrit", "Mega Crit Damage  (+1000%)")
-    cheatToggle("headshots")
+    cheatToggle("oneHit")
+
+    section("Loot")
+    cheatToggle("autoLoot")
+    NCT.lootRadius = sliderInt("lootradius", "Loot radius in metres", NCT.lootRadius, 3, 50)
+    hint("Takes everything from dead enemies within that distance, once per body.")
 
     section("Defense")
     cheatToggle("tankArmor", "Tank Armor  (+10,000)")
@@ -1948,6 +2086,15 @@ local function drawWorldPage()
             textColored(C.red, "Skip helper is NOT running. Press PLAY in the launcher to start it.")
         end
         textColored(C.dim, NCT.sceneActive and "A scene is playing right now." or "No scene is playing.")
+        local seen = NCT.sceneInfo
+        if seen then
+            local function yesNo(value)
+                if value == nil then return "unknown" end
+                return value and "yes" or "no"
+            end
+            textColored(C.dim, string.format("Skip prompt on screen: %s   Scene level: %s   Skippable: %s",
+                yesNo(seen.prompt), tostring(seen.tier or "unknown"), yesNo(seen.allowed)))
+        end
     end
     textColored(C.dim, "Skip speed")
     local sw = columnWidth(3)
@@ -2314,24 +2461,30 @@ local HERO_VEHICLES = {
 
 local function drawVehiclesPage()
     section("Current Vehicle")
-    local _, source = nil, nil
-    if getPlayer() then _, source = findVehicle() end
-    if source then
-        textColored(C.green, "The buttons below act on " .. source .. ".")
+    -- Looked up at most once a second, not on every frame.
+    if not NCT.vehicleLook or os.clock() - NCT.vehicleLook.time >= 1 then
+        local source = nil
+        if getPlayer() then
+            local _, found = findVehicle()
+            source = found
+        end
+        NCT.vehicleLook = { time = os.clock(), source = source }
+    end
+    if NCT.vehicleLook.source then
+        textColored(C.green, "The buttons below act on " .. NCT.vehicleLook.source .. ".")
     else
         hint("No vehicle found. Get in one, look at one, or call your car, then use the buttons below.")
     end
 
-    cheatToggle("carGod", "Indestructible Vehicle  (auto-repairs)")
-
     local w = columnWidth(2)
-    if primaryButton("REPAIR VEHICLE", w) then
-        run("Vehicle repaired", function() repairVehicle(requireVehicle()) end)
+    if primaryButton("SUMMON VEHICLE", w) then
+        run("Vehicle summoned", function() Game.GetVehicleSystem():SpawnPlayerVehicle() end)
     end
     ImGui.SameLine()
-    if primaryButton("FLIP UPRIGHT", w) then
+    if button("Flip Upright", w) then
         run("Vehicle flipped upright", flipVehicle)
     end
+    hint("If your vehicle is damaged or stuck, summon it again for a fresh one.")
 
     if button("Open All Doors", w) then
         run("Doors opened", function() setVehicleDoors(true) end)
@@ -2385,8 +2538,9 @@ local function drawTeleportPage()
     section("Fly Mode")
     cheatToggle("fly", "Fly Mode  (no clip)")
     NCT.flySpeed = sliderInt("flyspeed", "Fly speed in metres per second", NCT.flySpeed, 5, 100)
-    hint("Bind the four Fly keys in CET's Bindings tab first. You hover in place, then move where the "
-        .. "camera points. Switch on God Mode before turning Fly Mode off high up.")
+    hint("Bind the six Fly keys in CET's Bindings tab first. Using W, A, S, D, Space and Ctrl works well. "
+        .. "Forward and back follow where the camera points, left and right strafe, so turning the "
+        .. "camera steers you. Switch on God Mode before turning Fly Mode off high up.")
 
     section("Blink")
     NCT.blinkDistance = sliderInt("blink", "Distance in metres", NCT.blinkDistance, 2, 100)
@@ -2474,11 +2628,10 @@ end
 local HOTKEY_HELP = {
     "Add E$ 100,000", "Heal to full", "Refill ammo", "Clear wanted level",
     "Toggle God Mode", "Toggle Infinite Ammo", "Toggle Slow Motion", "Toggle Fly Mode",
-    "Toggle Indestructible Vehicle", "Repair vehicle", "Flip vehicle upright",
-    "Kill hostile enemies nearby", "Toggle Auto Skip Cutscenes", "Toggle Perfect Aim",
-    "Toggle Free Instant Quickhacks",
+    "Flip vehicle upright", "Kill hostile enemies nearby", "Toggle Auto Skip Cutscenes",
+    "Toggle Perfect Aim", "Toggle Free Instant Quickhacks", "Toggle One-Hit Kill", "Toggle Auto Loot",
     "Blink forward", "Teleport to first saved spot", "Turn every cheat off",
-    "Fly: forward / back / up / down  (hold)",
+    "Fly: forward / back / left / right / up / down  (hold)",
 }
 
 local function drawSettingsPage()
@@ -2645,6 +2798,8 @@ end
 ---------------------------------------------------------------------------
 
 registerForEvent("onInit", function()
+    -- The damage hook has to exist before saved cheats are restored.
+    NCT.hitHooked = hookHits()
     loadSettings()
     print("[NightCityTrainer] v" .. NCT.version .. " loaded. Open the CET overlay to use it.")
 end)
@@ -2690,6 +2845,25 @@ registerForEvent("onUpdate", function(delta)
         end
     end
 
+    -- Protection that has to react within a fraction of a second.
+    NCT.guardTick = (NCT.guardTick or 0) + delta
+    if NCT.guardTick >= 0.05 then
+        NCT.guardTick = 0
+        if getPlayer() then
+            if NCT.godMode then pcall(fillPool, gamedataStatPoolType.Health) end
+            if NCT.noFall then pcall(guardFalls) else NCT.fall = nil end
+        end
+    end
+
+    NCT.lootTick = (NCT.lootTick or 0) + delta
+    if NCT.lootTick >= 1 then
+        NCT.lootTick = 0
+        if NCT.autoLoot and getPlayer() then
+            local ok, taken = pcall(autoLootNearby)
+            if ok and taken and taken > 0 then toast("Auto Loot: emptied " .. taken .. (taken == 1 and " body" or " bodies"), true) end
+        end
+    end
+
     pcall(stepShopBuild)
     pcall(stepBulk)
 
@@ -2710,6 +2884,12 @@ registerForEvent("onUpdate", function(delta)
         elseif not present then
             NCT.hadPlayer = false
         end
+
+        -- Dying and respawning wipes every stat change, so everything is put back.
+        local dead = false
+        if present then pcall(function() dead = getPlayer():IsDead() == true end) end
+        if NCT.wasDead and not dead then onNewSave() end
+        NCT.wasDead = dead
 
         if NCT.autoSkip and present then
             pcall(autoSkipScenes)
@@ -2736,10 +2916,12 @@ registerForEvent("onUpdate", function(delta)
         if getPlayer() then
             if NCT.pendingRestore then restoreCheats() end
             -- Re-applied regularly so toggles survive loading another save.
-            if NCT.godMode then pcall(setGodMode, true) end
+            if NCT.godMode then pcall(CHEATS.godMode.apply, true) end
             if NCT.noPolice then pcall(setPolice, false) end
-            if NCT.carGod then pcall(protectVehicle) end
+            if NCT.invisible then pcall(function() getPlayer():SetInvisible(true) end) end
             if NCT.fovOn then pcall(applyFov) end
+            NCT.reassertCount = (NCT.reassertCount or 0) + 1
+            if NCT.reassertCount % 3 == 0 then reassertStatCheats() end
             if NCT.infAmmo then
                 pcall(setInfiniteAmmoEffect, true)
                 pcall(topUpAmmo)
@@ -2792,14 +2974,11 @@ cheatHotkey("nct_god_mode", "godMode")
 cheatHotkey("nct_inf_ammo", "infAmmo")
 cheatHotkey("nct_slow_mo", "slowMo")
 cheatHotkey("nct_fly", "fly")
-cheatHotkey("nct_car_god", "carGod")
+cheatHotkey("nct_one_hit", "oneHit")
+cheatHotkey("nct_auto_loot", "autoLoot")
 cheatHotkey("nct_auto_skip", "autoSkip")
 cheatHotkey("nct_perfect_aim", "perfectAim")
 cheatHotkey("nct_instant_hacks", "instantHacks")
-
-registerHotkey("nct_repair_vehicle", "Repair vehicle", function()
-    run("Vehicle repaired", function() repairVehicle(requireVehicle()) end)
-end)
 
 registerHotkey("nct_flip_vehicle", "Flip vehicle upright", function()
     run("Vehicle flipped upright", flipVehicle)
@@ -2829,6 +3008,8 @@ registerHotkey("nct_all_off", "Turn every cheat off", everythingOff)
 
 registerInput("nct_fly_forward", "Fly: forward (hold)", function(down) NCT.keys.fwd = down end)
 registerInput("nct_fly_back", "Fly: back (hold)", function(down) NCT.keys.back = down end)
+registerInput("nct_fly_left", "Fly: strafe left (hold)", function(down) NCT.keys.left = down end)
+registerInput("nct_fly_right", "Fly: strafe right (hold)", function(down) NCT.keys.right = down end)
 registerInput("nct_fly_up", "Fly: up (hold)", function(down) NCT.keys.up = down end)
 registerInput("nct_fly_down", "Fly: down (hold)", function(down) NCT.keys.down = down end)
 
