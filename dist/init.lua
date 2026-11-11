@@ -3,7 +3,7 @@
 -- Open the CET overlay in game to show the menu.
 
 local NCT = {
-    version = "4.5.0",
+    version = "4.6.0",
     overlayOpen = false,
     page = "Home",
     tick = 0,
@@ -33,6 +33,8 @@ local NCT = {
     blinkDistance = 10,
     flySpeed = 15,
     xpMult = 1,
+    skillValue = 60,
+    job = nil,          -- long task (recipe unlock) running in slices
     lootRadius = 15,    -- metres around the player that Auto Loot reaches
     looted = {},        -- bodies already looted, so each is only emptied once
     hitHooked = false,  -- set once the one-hit-kill damage hook was accepted
@@ -1808,6 +1810,114 @@ local function maxAttributes()
     return confirmed == #ATTRIBUTES
 end
 
+---------------------------------------------------------------------------
+-- Progression helpers: skills, crafting recipes, weapon upgrades
+---------------------------------------------------------------------------
+
+-- Skill names as shown in the game, with the game's internal names.
+local SKILL_NAMES = {
+    { "Headhunter", "CoolSkill" },
+    { "Netrunner", "IntelligenceSkill" },
+    { "Shinobi", "ReflexesSkill" },
+    { "Solo", "StrengthSkill" },
+    { "Engineer", "TechnicalAbilitySkill" },
+}
+
+local function craftingSystem()
+    local system = Game.GetScriptableSystemsContainer():Get(CName.new("CraftingSystem"))
+    if not system then error("crafting system not found") end
+    return system
+end
+
+-- Long jobs run in small slices so the game never freezes.
+local function startJob(label, list, fn)
+    NCT.job = { label = label, list = list, fn = fn, index = 1, done = 0, failed = 0 }
+end
+
+local function stepJob()
+    local job = NCT.job
+    if not job then return end
+    if not getPlayer() then
+        NCT.job = nil
+        return
+    end
+    local last = math.min(job.index + 59, #job.list)
+    for i = job.index, last do
+        local ok, changed = pcall(job.fn, job.list[i])
+        if not ok then
+            job.failed = job.failed + 1
+        elseif changed then
+            job.done = job.done + 1
+        end
+    end
+    job.index = last + 1
+    if job.index > #job.list then
+        local text = job.label .. ": " .. job.done .. " added"
+        if job.failed > 0 then text = text .. " (" .. job.failed .. " skipped)" end
+        toast(text, job.done > 0 or job.failed == 0)
+        NCT.job = nil
+    end
+end
+
+-- Teaches every crafting recipe in the game, iconic ones included.
+local function unlockAllRecipes()
+    if NCT.job then error("another job is still running") end
+    local records = TweakDB:GetRecords("gamedataItemRecipe_Record")
+    if type(records) ~= "table" or #records == 0 then error("the game would not list its recipes") end
+    local book = craftingSystem():GetPlayerCraftBook()
+    local targets = {}
+    for _, record in ipairs(records) do
+        local ok, target = pcall(function() return record:CraftingResult():Item():GetID() end)
+        targets[#targets + 1] = ok and target or record:GetID()
+    end
+    startJob("Recipes", targets, function(target)
+        if book:KnowsRecipe(target) then return false end
+        book:AddRecipe(target, {}, 1)
+        return true
+    end)
+    return "Unlocking " .. #targets .. " recipes..."
+end
+
+-- The materials an upgrade can need, handed over first so upgrades are free.
+local UPGRADE_MATERIALS = {
+    "Items.CommonMaterial1", "Items.UncommonMaterial1", "Items.RareMaterial1",
+    "Items.EpicMaterial1", "Items.LegendaryMaterial1",
+}
+
+local function heldWeaponId()
+    local item = Game.GetTransactionSystem():GetItemInSlot(getPlayer(), TweakDBID.new("AttachmentSlots.WeaponRight"))
+    if not item then error("hold a weapon in your hands first") end
+    return item:GetItemID()
+end
+
+local function upgradeHeldWeapon(times)
+    local id = heldWeaponId()
+    for _, name in ipairs(UPGRADE_MATERIALS) do pcall(giveItem, name, 300 * times) end
+    local crafting = craftingSystem()
+    for _ = 1, times do
+        local ok = pcall(function() crafting:UpgradeItem(getPlayer(), id) end)
+        if not ok then
+            local request = UpgradeItemRequest.new()
+            request.owner = getPlayer()
+            request.itemID = id
+            crafting:QueueRequest(request)
+        end
+    end
+    return "Upgrade x" .. times .. " sent - check the weapon's tier in your inventory"
+end
+
+local function addSkillXp(amount)
+    local reason = gainReason()
+    local given = 0
+    for _, skill in ipairs(SKILL_NAMES) do
+        if pcall(function()
+            devData():AddExperience(amount, gamedataProficiencyType[skill[2]], reason, false)
+        end) then given = given + 1 end
+    end
+    if given == 0 then error("the game would not add skill experience") end
+    return "Gave " .. formatNumber(amount) .. " XP to " .. given .. " skills"
+end
+
 -- Refunds spent perk or attribute points, and reports how many points you have now.
 local function respec(kind)
     local data = devData()
@@ -1917,13 +2027,68 @@ local function drawProgressPage()
         end)
     end
 
-    if button("Max All Skills  (level 60)", availWidth()) then
+    local lw = columnWidth(2)
+    if button("Level Up  (+1)", lw) then
+        run("Level up", function()
+            local target = math.min(getProficiency("Level") + 1, 60)
+            if setProficiency("Level", target) then return "Level " .. target end
+            return "Level change requested - check the character menu"
+        end)
+    end
+    ImGui.SameLine()
+    if button("Street Cred Up  (+1)", lw) then
+        run("Street cred up", function()
+            local target = math.min(getProficiency("StreetCred") + 1, 50)
+            if setProficiency("StreetCred", target) then return "Street cred " .. target end
+            return "Street cred change requested - check the character menu"
+        end)
+    end
+
+    section("Skills")
+    NCT.skillValue = sliderInt("skillval", "Set skill to", NCT.skillValue, 1, 60)
+    local sw = columnWidth(#SKILL_NAMES)
+    for i, skill in ipairs(SKILL_NAMES) do
+        if button(skill[1] .. "##skill", sw) then
+            run("Set " .. skill[1], function()
+                if setProficiency(skill[2], NCT.skillValue) then
+                    return skill[1] .. " set to " .. NCT.skillValue
+                end
+                return skill[1] .. " change requested - check the character menu"
+            end)
+        end
+        if i < #SKILL_NAMES then ImGui.SameLine() end
+    end
+    local kw = columnWidth(2)
+    if button("+5,000 XP To Every Skill", kw) then
+        run("Skill XP", function() return addSkillXp(5000) end)
+    end
+    ImGui.SameLine()
+    if button("Max All Skills  (60)", kw) then
         run("Max all skills", function()
             if maxSkills() then return "All 5 skills set to 60" end
             return "Skill changes requested - check the character menu"
         end)
     end
-    hint("Headhunter, Netrunner, Shinobi, Solo and Engineer.")
+    hint("Skill levels unlock the skill's passive bonuses, like the game's own skill progression.")
+
+    section("Crafting & Gear")
+    if primaryButton("UNLOCK ALL CRAFTING RECIPES", availWidth()) then
+        run("Unlock recipes", unlockAllRecipes)
+    end
+    local job = NCT.job
+    if job then
+        textColored(C.cyan, string.format("%s...  %d of %d", job.label, math.min(job.index - 1, #job.list), #job.list))
+        pcall(ImGui.ProgressBar, (job.index - 1) / #job.list, availWidth(), em(1))
+    end
+    local uw = columnWidth(2)
+    if button("Upgrade Held Weapon  (+1)", uw) then
+        run("Upgrade weapon", function() return upgradeHeldWeapon(1) end)
+    end
+    ImGui.SameLine()
+    if button("Max Upgrade Held Weapon", uw) then
+        run("Upgrade weapon", function() return upgradeHeldWeapon(10) end)
+    end
+    hint("Upgrades the weapon in your hands for free: the materials are handed to you first.")
 
     section("Attributes")
     NCT.attrValue = sliderInt("attrval", "Set attribute to", NCT.attrValue, 3, 20)
@@ -2866,6 +3031,7 @@ registerForEvent("onUpdate", function(delta)
 
     pcall(stepShopBuild)
     pcall(stepBulk)
+    pcall(stepJob)
 
     if NCT.saveTick >= 5 then
         NCT.saveTick = 0
