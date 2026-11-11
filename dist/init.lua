@@ -3,7 +3,7 @@
 -- Open the CET overlay in game to show the menu.
 
 local NCT = {
-    version = "4.0.0",
+    version = "4.1.0",
     overlayOpen = false,
     page = "Home",
     tick = 0,
@@ -114,10 +114,19 @@ end
 
 -- Gives an item and confirms it really arrived in the inventory.
 local function giveItemChecked(name, qty)
+    -- Weapons and clothing are not stackable, so counting them is unreliable.
+    -- The item ID is checked against the game's database first instead.
+    if not TweakDB:GetRecord(name) then
+        error("'" .. name .. "' is not a valid item ID on this game version")
+    end
     local before = itemCount(name)
     giveItem(name, qty)
-    if itemCount(name) <= before then
-        error("'" .. name .. "' is not a valid item ID on this game version")
+    if itemCount(name) > before then return end
+    local ok, owned = pcall(function()
+        return Game.GetTransactionSystem():HasItem(getPlayer(), itemID(name))
+    end)
+    if not (ok and owned == true) then
+        error("the game did not add '" .. name .. "'")
     end
 end
 
@@ -1549,6 +1558,294 @@ local function drawWorldPage()
 
 end
 
+---------------------------------------------------------------------------
+-- Shop: browse every item the game has, search it, and add or buy it.
+---------------------------------------------------------------------------
+
+local SHOP_CATEGORIES = {
+    { "Weapons", "gamedataWeaponItem_Record" },
+    { "Clothing", "gamedataClothing_Record" },
+    { "Grenades", "gamedataGrenade_Record" },
+    { "Everything", "gamedataItem_Record" },
+}
+
+local SHOP = {
+    cat = "Weapons",
+    search = "",
+    qty = 1,
+    pay = false,
+    limit = 60,
+    lists = {},       -- category name -> list of items
+    failed = {},      -- categories whose list could not be read
+    build = nil,      -- item list currently being loaded
+    bulk = nil,       -- bulk add currently running
+    confirmBulk = false,
+    filterKey = nil,
+    filtered = {},
+}
+
+-- Test, NPC-only and internal items are hidden from the shop.
+local function junkItem(id)
+    local l = id:lower()
+    return not l:find("^items%.") or l:find("npc") or l:find("items%.base_") or l:find("[_%.]test")
+        or l:find("debug") or l:find("dummy") or l:find("_dev[_%.]") or l:find("^items%.q%d%d%d_test")
+end
+
+local function startShopBuild(catName, onDone)
+    if SHOP.lists[catName] then
+        if onDone then onDone(SHOP.lists[catName]) end
+        return
+    end
+    if SHOP.build then
+        toast("Still loading the item list, try again in a moment.", false)
+        return
+    end
+    local className
+    for _, c in ipairs(SHOP_CATEGORIES) do
+        if c[1] == catName then className = c[2] end
+    end
+    local ok, records = pcall(function() return TweakDB:GetRecords(className) end)
+    if not ok or type(records) ~= "table" or #records == 0 then
+        SHOP.failed[catName] = true
+        toast("Could not read the " .. catName .. " list from the game.", false)
+        return
+    end
+    SHOP.build = { cat = catName, records = records, index = 1, entries = {}, onDone = onDone }
+end
+
+-- Loads the list in small slices so the game never freezes.
+local function stepShopBuild()
+    local job = SHOP.build
+    if not job then return end
+    local last = math.min(job.index + 149, #job.records)
+    for i = job.index, last do
+        pcall(function()
+            local record = job.records[i]
+            local id = TDBID.ToStringDEBUG(record:GetID())
+            if type(id) ~= "string" or junkItem(id) then return end
+            local name = Game.GetLocalizedTextByKey(record:DisplayName())
+            if type(name) ~= "string" or name == "" or #name > 70 then return end
+            local iconic = false
+            pcall(function() iconic = record:IsIconic() == true end)
+            if not iconic then
+                pcall(function() iconic = record:TagsContains(CName.new("IconicWeapon")) == true end)
+            end
+            job.entries[#job.entries + 1] = {
+                id = id, name = name, iconic = iconic, key = (name .. " " .. id):lower(),
+            }
+        end)
+    end
+    job.index = last + 1
+    if job.index > #job.records then
+        table.sort(job.entries, function(a, b)
+            if a.name ~= b.name then return a.name < b.name end
+            return a.id < b.id
+        end)
+        SHOP.lists[job.cat] = job.entries
+        SHOP.filterKey = nil
+        SHOP.build = nil
+        toast("Loaded " .. #job.entries .. " " .. job.cat:lower() .. ".", true)
+        if job.onDone then job.onDone(job.entries) end
+    end
+end
+
+local function shopFiltered()
+    local list = SHOP.lists[SHOP.cat]
+    if not list then return nil end
+    local key = SHOP.cat .. "|" .. SHOP.search:lower()
+    if SHOP.filterKey == key then return SHOP.filtered end
+    local words = {}
+    for word in SHOP.search:lower():gmatch("%S+") do words[#words + 1] = word end
+    local out = {}
+    for _, entry in ipairs(list) do
+        local match = true
+        for _, word in ipairs(words) do
+            if not entry.key:find(word, 1, true) then
+                match = false
+                break
+            end
+        end
+        if match then out[#out + 1] = entry end
+    end
+    SHOP.filtered, SHOP.filterKey = out, key
+    return out
+end
+
+-- The item's value as the game calculates it, or nil when it can't be read.
+local function itemPrice(id)
+    local ok, price = pcall(function()
+        local instance = GetGameInstance and GetGameInstance() or Game.GetGameInstance()
+        return RPGManager.CalculateSellPrice(instance, getPlayer(), itemID(id))
+    end)
+    if ok and type(price) == "number" and price >= 0 then return math.floor(price) end
+    return nil
+end
+
+local function shopAdd(entry, qty)
+    local cost = 0
+    if SHOP.pay then
+        local price = itemPrice(entry.id)
+        if not price then error("this item's price can't be read - switch off Pay With Eddies") end
+        cost = price * qty
+        local money = itemCount("Items.money")
+        if money < cost then
+            error("not enough eddies: you need E$ " .. formatNumber(cost) .. " and have E$ " .. formatNumber(money))
+        end
+    end
+    giveItemChecked(entry.id, qty)
+    if cost > 0 then
+        Game.GetTransactionSystem():RemoveItem(getPlayer(), itemID("Items.money"), cost)
+        return "Bought " .. entry.name .. " for E$ " .. formatNumber(cost)
+    end
+    return "Added " .. entry.name .. (qty > 1 and (" x" .. qty) or "")
+end
+
+local function startBulk(label, ids)
+    SHOP.bulk = { label = label, ids = ids, index = 1, given = 0, failed = 0 }
+end
+
+local function stepBulk()
+    local job = SHOP.bulk
+    if not job then return end
+    if not getPlayer() then
+        SHOP.bulk = nil
+        return
+    end
+    local last = math.min(job.index + 14, #job.ids)
+    for i = job.index, last do
+        if pcall(giveItemChecked, job.ids[i], 1) then
+            job.given = job.given + 1
+        else
+            job.failed = job.failed + 1
+        end
+    end
+    job.index = last + 1
+    if job.index > #job.ids then
+        local text = job.label .. ": added " .. job.given .. " items"
+        if job.failed > 0 then text = text .. " (" .. job.failed .. " skipped)" end
+        toast(text, job.given > 0)
+        SHOP.bulk = nil
+    end
+end
+
+local function bulkAdd(catName, label, predicate)
+    if SHOP.bulk then
+        toast("A bulk add is already running.", false)
+        return
+    end
+    if not getPlayer() then
+        toast("Load a save first.", false)
+        return
+    end
+    startShopBuild(catName, function(list)
+        local ids = {}
+        for _, entry in ipairs(list) do
+            if not predicate or predicate(entry) then ids[#ids + 1] = entry.id end
+        end
+        if #ids == 0 then
+            toast(label .. ": nothing found to add.", false)
+            return
+        end
+        startBulk(label, ids)
+    end)
+end
+
+local function drawShopPage()
+    -- Load the list for the selected category the first time it is shown.
+    if not SHOP.lists[SHOP.cat] and not SHOP.build and not SHOP.failed[SHOP.cat] then
+        startShopBuild(SHOP.cat)
+    end
+
+    section("Unlock Everything")
+    SHOP.confirmBulk = ImGui.Checkbox("I understand this adds a lot of items to my inventory", SHOP.confirmBulk)
+    local w = columnWidth(3)
+    if SHOP.confirmBulk then
+        if primaryButton("ALL WEAPONS", w) then
+            bulkAdd("Weapons", "All weapons")
+        end
+        ImGui.SameLine()
+        if primaryButton("ICONIC WEAPONS", w) then
+            bulkAdd("Weapons", "Iconic weapons", function(e) return e.iconic end)
+        end
+        ImGui.SameLine()
+        if primaryButton("ALL CLOTHING", w) then
+            bulkAdd("Clothing", "All clothing")
+        end
+    else
+        hint("Tick the box to enable the buttons.")
+    end
+    hint("Everything is added for free and can be very heavy. Raise your carry weight on the Player page first.")
+
+    local bulk = SHOP.bulk
+    if bulk then
+        textColored(C.cyan, string.format("Adding %s...  %d of %d", bulk.label, math.min(bulk.index - 1, #bulk.ids), #bulk.ids))
+        pcall(ImGui.ProgressBar, (bulk.index - 1) / #bulk.ids, availWidth(), em(1))
+    end
+
+    section("Browse")
+    w = columnWidth(#SHOP_CATEGORIES)
+    for i, c in ipairs(SHOP_CATEGORIES) do
+        local label = c[1] .. "##shopcat"
+        if SHOP.cat == c[1] then
+            primaryButton(label, w)
+        elseif button(label, w) then
+            SHOP.cat = c[1]
+            SHOP.limit = 60
+        end
+        if i < #SHOP_CATEGORIES then ImGui.SameLine() end
+    end
+
+    beginField("Search  (try: katana, jacket, johnny)", false)
+    SHOP.search = ImGui.InputText("##shopsearch", SHOP.search, 100)
+    endField("shopsearch")
+
+    SHOP.qty = inputInt("shopqty", "Quantity", SHOP.qty, 1, 9999, 1)
+    local v, changed = switch("shoppay", "Pay with eddies  (off = everything is free)", SHOP.pay)
+    if changed then SHOP.pay = v end
+    if SHOP.pay then
+        textColored(C.dim, "Your balance: ")
+        ImGui.SameLine()
+        textColored(C.yellow, "E$ " .. formatNumber((NCT.info and NCT.info.money) or 0))
+    end
+
+    local build = SHOP.build
+    if build then
+        textColored(C.cyan, string.format("Loading %s...  %d%%", build.cat:lower(),
+            math.floor(math.min(build.index, #build.records) / #build.records * 100)))
+        return
+    end
+    if SHOP.failed[SHOP.cat] and not SHOP.lists[SHOP.cat] then
+        warn("The game would not list " .. SHOP.cat:lower() .. ". Try another category.")
+        return
+    end
+
+    local results = shopFiltered() or {}
+    local shown = math.min(#results, SHOP.limit)
+    textColored(C.dim, string.format("%d found, showing %d", #results, shown))
+
+    for i = 1, shown do
+        local entry = results[i]
+        if primaryButton((SHOP.pay and "BUY" or "ADD") .. "##shop" .. i, em(4)) then
+            run("Shop", function() return shopAdd(entry, SHOP.qty) end)
+        end
+        ImGui.SameLine()
+        textColored(entry.iconic and C.yellow or C.text, entry.name)
+        if SHOP.pay then
+            if entry.price == nil then entry.price = itemPrice(entry.id) or false end
+            ImGui.SameLine()
+            textColored(C.green, entry.price and ("E$ " .. formatNumber(entry.price)) or "price n/a")
+        end
+        ImGui.SameLine()
+        textColored(C.dim, entry.id:gsub("^Items%.", ""))
+    end
+    if #results > shown then
+        if button("Show 60 more", availWidth()) then SHOP.limit = SHOP.limit + 60 end
+    end
+    if #results == 0 then
+        hint("Nothing matches that search.")
+    end
+end
+
 local HERO_VEHICLES = {
     { "Rayfield Caliburn", "Vehicle.v_sport1_rayfield_caliburn_player" },
     { "Rayfield Aerondight", "Vehicle.v_sport1_rayfield_aerondight_player" },
@@ -1763,6 +2060,7 @@ local PAGES = {
     { "Combat", drawCombatPage, "Sword" },
     { "Money", drawMoneyPage, "Cash" },
     { "Progress", drawProgressPage, "TrendingUp" },
+    { "Shop", drawShopPage, "Cart" },
     { "Items", drawItemsPage, "PackageVariant" },
     { "Vehicles", drawVehiclesPage, "Car" },
     { "World", drawWorldPage, "Earth" },
@@ -1908,6 +2206,8 @@ registerForEvent("onUpdate", function(delta)
     NCT.slowTick = NCT.slowTick + delta
 
     if NCT.fly then pcall(updateFly, delta) end
+    pcall(stepShopBuild)
+    pcall(stepBulk)
 
     if NCT.tick >= 0.2 then
         NCT.tick = 0
