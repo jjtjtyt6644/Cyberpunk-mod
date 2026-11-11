@@ -3,7 +3,7 @@
 -- Open the CET overlay in game to show the menu.
 
 local NCT = {
-    version = "4.6.0",
+    version = "4.7.0",
     overlayOpen = false,
     page = "Home",
     tick = 0,
@@ -37,7 +37,6 @@ local NCT = {
     job = nil,          -- long task (recipe unlock) running in slices
     lootRadius = 15,    -- metres around the player that Auto Loot reaches
     looted = {},        -- bodies already looted, so each is only emptied once
-    hitHooked = false,  -- set once the one-hit-kill damage hook was accepted
     skipSpeed = 2,      -- how fast the skip helper presses: 1 balanced, 2 fast, 3 insane
     fovValue = 80,
     fovOn = false,
@@ -324,33 +323,57 @@ local function setPoolValue(entityId, pool, value)
     Game.GetStatPoolsSystem():RequestSettingStatPoolValue(entityId, pool, value, nil)
 end
 
--- Runs when anything is hit. With One-Hit Kill on, hostile enemies that the
--- player hits die on the spot. Everything is guarded: a hook that throws
--- would otherwise show up in every fight.
-local function onNpcHit(npc, hit)
-    if not NCT.oneHit then return end
-    pcall(function()
-        local player = getPlayer()
-        if not player then return end
-        local attacker = hit.attackData:GetInstigator()
-        if not attacker or not attacker:IsPlayer() then return end
-        if npc:IsDead() then return end
-        if GameObject.GetAttitudeTowards(npc, player) ~= EAIAttitude.AIA_Hostile then return end
-        if not pcall(function() npc:Kill(player, false, false) end) then
-            setPoolValue(npc:GetEntityID(), gamedataStatPoolType.Health, 0)
-        end
+local function isHostile(npc, player)
+    local ok, hostile = pcall(function()
+        return GameObject.GetAttitudeTowards(npc, player) == EAIAttitude.AIA_Hostile
     end)
+    return ok and hostile
 end
 
--- Registers the damage hook once. Returns true when the game accepted it.
-local function hookHits()
-    for _, className in ipairs({ "NPCPuppet", "ScriptedPuppet" }) do
-        local ok = pcall(function()
-            Observe(className, "OnHitEvent", function(self, hit) onNpcHit(self, hit) end)
-        end)
-        if ok then return true end
+local function killNpc(npc, player)
+    if not pcall(function() npc:Kill(player, false, false) end) then
+        setPoolValue(npc:GetEntityID(), gamedataStatPoolType.Health, 0)
     end
-    return false
+end
+
+-- One-Hit Kill: about ten times a second, any hostile enemy nearby that has
+-- lost health is finished off. This needs no hook into the game's damage code.
+local function oneHitSweep()
+    local player = getPlayer()
+    for _, npc in ipairs(player:GetNPCsAroundObject(80)) do
+        local alive = false
+        pcall(function() alive = not npc:IsDead() end)
+        if alive and isHostile(npc, player) then
+            local ok, percent = pcall(function()
+                return Game.GetStatPoolsSystem():GetStatPoolValue(npc:GetEntityID(), gamedataStatPoolType.Health, true)
+            end)
+            if ok and type(percent) == "number" and percent < 99.5 then pcall(killNpc, npc, player) end
+        end
+    end
+end
+
+-- Invisible extra: enemies that had already locked on forget about you.
+local function dropAggro()
+    local player = getPlayer()
+    for _, npc in ipairs(player:GetNPCsAroundObject(80)) do
+        pcall(function() npc:GetTargetTrackerComponent():ClearThreats() end)
+    end
+end
+
+-- High falls can kill in one hit, faster than health can be put back. While
+-- the player is falling fast, a temporary shield blocks all damage.
+local function setFallShield(on)
+    if NCT.fallShield == on then return end
+    NCT.fallShield = on
+    local gm = Game.GetGodModeSystem()
+    local id = getPlayer():GetEntityID()
+    local reason = CName.new(REASON .. "Fall")
+    for _, kind in ipairs({ "Invulnerable", "Immortal" }) do
+        pcall(function()
+            local mode = gameGodModeType[kind]
+            if on then gm:AddGodMode(id, mode, reason) else gm:RemoveGodMode(id, mode, reason) end
+        end)
+    end
 end
 
 -- Fall guard: when the player has just been falling fast and health suddenly
@@ -372,6 +395,8 @@ local function guardFalls()
             hp = last.hp
         end
     end
+    -- Shield on while falling and for a moment after landing.
+    setFallShield(now < airUntil + 0.5)
     NCT.fall = { hp = hp, z = z, time = now, airUntil = airUntil }
 end
 
@@ -646,6 +671,32 @@ local function flipVehicle()
         Vector4.new(pos.x, pos.y, pos.z + 1.0, 1), EulerAngles.new(0, 0, angles.yaw))
 end
 
+-- Fixes a wrecked personal vehicle once, then calls it to you. This is a single
+-- repair when you press the button, not the old always-on repair that could
+-- throw the car around.
+local function reviveVehicle()
+    local vehicleSystem = Game.GetVehicleSystem()
+    local vehicle = calledVehicle() or lookedAtVehicle() or mountedVehicle()
+    local repaired = 0
+    if vehicle then
+        if pcall(function() vehicle:GetVehicleComponent():RepairVehicle() end) then repaired = repaired + 1 end
+        if pcall(function() vehicle:DestructionResetGrid() end) then repaired = repaired + 1 end
+        if pcall(function() vehicle:DestructionResetGlass() end) then repaired = repaired + 1 end
+        pcall(function()
+            Game.GetStatPoolsSystem():RequestSettingStatPoolMaxValue(vehicle:GetEntityID(),
+                gamedataStatPoolType.Health, nil)
+        end)
+    end
+    local onCooldown = false
+    pcall(function() onCooldown = vehicleSystem:IsActivePlayerVehicleOnCooldown() == true end)
+    pcall(function() vehicleSystem:SpawnPlayerVehicle() end)
+    if onCooldown then
+        return "Repaired, but the game still has this car on its summon cooldown - pick another car to call meanwhile"
+    end
+    if repaired > 0 then return "Vehicle repaired and called" end
+    return "Vehicle called"
+end
+
 local function setVehicleDoors(open)
     local vehicle = requireVehicle()
     local ok = pcall(function()
@@ -807,12 +858,7 @@ local CHEATS = {
     },
     oneHit = {
         label = "One-Hit Kill",
-        desc = "Any hit you land on a hostile enemy kills them instantly.",
-        apply = function(on)
-            if on and not NCT.hitHooked then
-                error("could not hook into the game's damage events on this version")
-            end
-        end,
+        desc = "Any hostile enemy that takes damage dies instantly.",
     },
     autoLoot = {
         label = "Auto Loot",
@@ -900,7 +946,11 @@ local CHEATS = {
         desc = "Every hit is a critical hit.",
     },
     megaCrit = {
-        label = "Mega Crit Damage", apply = statCheat("megaCrit", "CritDamage", "Additive", 1000),
+        label = "Mega Crit Damage",
+        apply = multiStatCheat("megaCrit", {
+            { "CritDamage", "Additive", 1000 },
+            { "CritDamageBonus", "Additive", 1000 },
+        }),
         desc = "Critical hits deal +1000% damage.",
     },
     tankArmor = {
@@ -908,8 +958,12 @@ local CHEATS = {
         desc = "Adds 10,000 armor.",
     },
     invisible = {
-        label = "Invisible", apply = function(on) getPlayer():SetInvisible(on) end,
-        desc = "Enemies cannot see you.",
+        label = "Invisible",
+        apply = function(on)
+            getPlayer():SetInvisible(on)
+            if on then pcall(dropAggro) end
+        end,
+        desc = "Enemies cannot see you, and ones already chasing you lose track of you.",
     },
     slowMo = {
         label = "Slow Motion", apply = function(on) setGameSpeed(on and 0.25 or 1.0) end,
@@ -1233,6 +1287,7 @@ local function onNewSave()
     NCT.mods = {}
     NCT.flyPos = nil
     NCT.fall = nil
+    NCT.fallShield = nil
     NCT.mountCache = nil
     NCT.restoreTries = 0
     NCT.pendingRestore = keys
@@ -1591,8 +1646,8 @@ local function drawHomePage()
         run("Wanted level cleared", clearWanted)
     end
     ImGui.SameLine()
-    if button("Summon Vehicle", w) then
-        run("Vehicle summoned", function() Game.GetVehicleSystem():SpawnPlayerVehicle() end)
+    if button("Repair & Call Car", w) then
+        run("Repair vehicle", reviveVehicle)
     end
 
     section("Profiles")
@@ -1830,8 +1885,8 @@ local function craftingSystem()
 end
 
 -- Long jobs run in small slices so the game never freezes.
-local function startJob(label, list, fn)
-    NCT.job = { label = label, list = list, fn = fn, index = 1, done = 0, failed = 0 }
+local function startJob(label, list, fn, onDone)
+    NCT.job = { label = label, list = list, fn = fn, onDone = onDone, index = 1, done = 0, failed = 0 }
 end
 
 local function stepJob()
@@ -1856,11 +1911,12 @@ local function stepJob()
         if job.failed > 0 then text = text .. " (" .. job.failed .. " skipped)" end
         toast(text, job.done > 0 or job.failed == 0)
         NCT.job = nil
+        if job.onDone then pcall(job.onDone) end
     end
 end
 
 -- Teaches every crafting recipe in the game, iconic ones included.
-local function unlockAllRecipes()
+local function unlockAllRecipes(onDone)
     if NCT.job then error("another job is still running") end
     local records = TweakDB:GetRecords("gamedataItemRecipe_Record")
     if type(records) ~= "table" or #records == 0 then error("the game would not list its recipes") end
@@ -1874,7 +1930,7 @@ local function unlockAllRecipes()
         if book:KnowsRecipe(target) then return false end
         book:AddRecipe(target, {}, 1)
         return true
-    end)
+    end, onDone)
     return "Unlocking " .. #targets .. " recipes..."
 end
 
@@ -1918,6 +1974,119 @@ local function addSkillXp(amount)
     return "Gave " .. formatNumber(amount) .. " XP to " .. given .. " skills"
 end
 
+-- Everything in the player's inventory, as the game's item data objects.
+local function inventoryItems()
+    local ok, a, b = pcall(function() return Game.GetTransactionSystem():GetItemList(getPlayer()) end)
+    local list = ok and (type(a) == "table" and a or b) or nil
+    if type(list) ~= "table" then error("the game would not list your inventory") end
+    return list
+end
+
+local function itemTdbid(itemId)
+    local ok, tdb = pcall(function() return itemId.id end)
+    if ok and tdb then return tdb end
+    return ItemID.GetTDBID(itemId)
+end
+
+local function hasTag(data, tag)
+    local ok, value = pcall(function() return data:HasTag(CName.new(tag)) end)
+    return ok and value == true
+end
+
+-- Upgrades every piece of cyberware you own, without a ripperdoc. Money and
+-- materials are handed over first so the upgrades cost nothing.
+local function upgradeAllCyberware()
+    local crafting = craftingSystem()
+    local player = getPlayer()
+    pcall(giveItem, "Items.money", 500000)
+    for _, name in ipairs(UPGRADE_MATERIALS) do pcall(giveItem, name, 2000) end
+    local count = 0
+    for _, data in ipairs(inventoryItems()) do
+        if hasTag(data, "Cyberware") then
+            local id = data:GetID()
+            for _ = 1, 5 do
+                if not pcall(function() crafting:UpgradeItem(player, id) end) then
+                    pcall(function()
+                        local request = UpgradeItemRequest.new()
+                        request.owner = player
+                        request.itemID = id
+                        crafting:QueueRequest(request)
+                    end)
+                end
+            end
+            count = count + 1
+        end
+    end
+    if count == 0 then error("no cyberware found in your inventory") end
+    return "Upgrades sent for " .. count .. " cyberware items - check their tier in your inventory"
+end
+
+local function perkTypes()
+    local records = TweakDB:GetRecords("gamedataNewPerk_Record")
+    if type(records) ~= "table" or #records == 0 then error("the game would not list its perks") end
+    local types = {}
+    for _, record in ipairs(records) do
+        local ok, perkType = pcall(function() return record:Type() end)
+        if ok and perkType ~= nil then types[#types + 1] = perkType end
+    end
+    if #types == 0 then error("could not read the perk list") end
+    return types
+end
+
+local function perkLevel(data, perkType)
+    local level = data:IsNewPerkBought(perkType)
+    if type(level) == "boolean" then return level and 1 or 0 end
+    return tonumber(level) or 0
+end
+
+-- Buys every perk to its highest level, relic perks included. Attributes are
+-- maxed and plenty of points handed over first, because perks require both.
+local function maxAllPerks(onDone)
+    if NCT.job then error("another job is still running") end
+    local types = perkTypes()
+    pcall(maxAttributes)
+    pcall(addDevPoints, "Primary", 1000, "perk")
+    pcall(addDevPoints, "Espionage", 100, "relic")
+    -- Three passes, so perks that need a parent perk get bought after it.
+    local list = {}
+    for _ = 1, 3 do
+        for _, perkType in ipairs(types) do list[#list + 1] = perkType end
+    end
+    startJob("Perks", list, function(perkType)
+        local data = devData()
+        local maxLevel = 1
+        pcall(function() maxLevel = data:GetNewPerkMaxLevel(perkType) end)
+        local before = perkLevel(data, perkType)
+        local level = before
+        for _ = 1, maxLevel do
+            if level >= maxLevel then break end
+            pcall(function() data:UnlockNewPerk(perkType) end)
+            data:BuyNewPerk(perkType, true)
+            local now = perkLevel(data, perkType)
+            if now <= level then break end
+            level = now
+        end
+        return level > before
+    end, onDone)
+    return "Buying every perk..."
+end
+
+-- One button for everything: level, street cred, skills, attributes, cyberware,
+-- capacity, then every perk, then every recipe.
+local function maxEverything()
+    if NCT.job then error("another job is still running") end
+    pcall(setProficiency, "Level", 60)
+    pcall(setProficiency, "StreetCred", 50)
+    pcall(maxSkills)
+    pcall(function()
+        NCT.cwCapacity = math.max(NCT.cwCapacity, 300)
+        applyCyberwareCapacity()
+    end)
+    pcall(upgradeAllCyberware)
+    maxAllPerks(function() pcall(unlockAllRecipes) end)
+    return "Maxing everything: level, cred, skills, attributes, cyberware, then every perk and recipe..."
+end
+
 -- Refunds spent perk or attribute points, and reports how many points you have now.
 local function respec(kind)
     local data = devData()
@@ -1945,19 +2114,25 @@ local function drawProgressPage()
     local apply
 
     section("One Click")
-    if primaryButton("MAX OUT CHARACTER", availWidth()) then
-        run("Max out character", function()
-            local level = setProficiency("Level", 60)
-            local cred = setProficiency("StreetCred", 50)
-            local skills = maxSkills()
-            local attrs = maxAttributes()
-            if level and cred and skills and attrs then
-                return "Level 60, street cred 50, all skills 60, all attributes 20"
-            end
-            return "Max out requested - check the character menu"
-        end)
+    if primaryButton("MAX OUT EVERYTHING", availWidth()) then
+        run("Max out everything", maxEverything)
     end
-    hint("Level 60, street cred 50, every skill at 60 and every attribute at 20.")
+    hint("Level 60, street cred 50, every skill 60, every attribute 20, every perk, every cyberware "
+        .. "upgraded, +300 cyberware capacity and every crafting recipe.")
+    local oneJob = NCT.job
+    if oneJob then
+        textColored(C.cyan, string.format("%s...  %d of %d", oneJob.label,
+            math.min(oneJob.index - 1, #oneJob.list), #oneJob.list))
+        pcall(ImGui.ProgressBar, (oneJob.index - 1) / #oneJob.list, availWidth(), em(1))
+    end
+    local pw2 = columnWidth(2)
+    if button("Max All Perks", pw2) then
+        run("Max all perks", function() return maxAllPerks() end)
+    end
+    ImGui.SameLine()
+    if button("Upgrade All Cyberware", pw2) then
+        run("Upgrade cyberware", upgradeAllCyberware)
+    end
 
     section("Points")
     NCT.attrPoints, apply = inputInt("attr",
@@ -2073,7 +2248,7 @@ local function drawProgressPage()
 
     section("Crafting & Gear")
     if primaryButton("UNLOCK ALL CRAFTING RECIPES", availWidth()) then
-        run("Unlock recipes", unlockAllRecipes)
+        run("Unlock recipes", function() return unlockAllRecipes() end)
     end
     local job = NCT.job
     if job then
@@ -2441,13 +2616,17 @@ local function shopFiltered()
 end
 
 -- The item's value as the game calculates it, or nil when it can't be read.
-local function itemPrice(id)
+local function priceOf(itemId)
     local ok, price = pcall(function()
         local instance = GetGameInstance and GetGameInstance() or Game.GetGameInstance()
-        return RPGManager.CalculateSellPrice(instance, getPlayer(), itemID(id))
+        return RPGManager.CalculateSellPrice(instance, getPlayer(), itemId)
     end)
     if ok and type(price) == "number" and price >= 0 then return math.floor(price) end
     return nil
+end
+
+local function itemPrice(id)
+    return priceOf(itemID(id))
 end
 
 local function shopAdd(entry, qty)
@@ -2519,7 +2698,127 @@ local function bulkAdd(catName, label, predicate)
     end)
 end
 
+-- Selling: what you own, minus equipped gear, quest items and money.
+local function buildSellList()
+    local player = getPlayer()
+    local equipment = Game.GetScriptableSystemsContainer():Get(CName.new("EquipmentSystem"))
+    local list = {}
+    for _, data in ipairs(inventoryItems()) do
+        pcall(function()
+            local id = data:GetID()
+            local tdb = itemTdbid(id)
+            local name = TDBID.ToStringDEBUG(tdb)
+            if type(name) ~= "string" or name == "Items.money" then return end
+            if hasTag(data, "Quest") then return end
+            local equipped = false
+            pcall(function() equipped = equipment:IsEquipped(player, id) == true end)
+            if equipped then return end
+            local display = name
+            pcall(function()
+                local text = Game.GetLocalizedTextByKey(TweakDB:GetRecord(tdb):DisplayName())
+                if type(text) == "string" and text ~= "" then display = text end
+            end)
+            list[#list + 1] = {
+                id = id, name = display, tdbName = name, qty = data:GetQuantity(),
+                price = priceOf(id), junk = hasTag(data, "Junk"),
+            }
+        end)
+    end
+    table.sort(list, function(a, b) return a.name < b.name end)
+    SHOP.sellList = list
+end
+
+local function sellEntry(entry, qty)
+    qty = math.min(qty, entry.qty)
+    if qty <= 0 then error("you have none left") end
+    local price = entry.price or 0
+    Game.GetTransactionSystem():RemoveItem(getPlayer(), entry.id, qty)
+    if price > 0 then giveItem("Items.money", price * qty) end
+    entry.qty = entry.qty - qty
+    return price * qty
+end
+
+local function drawSellView()
+    if not SHOP.sellList and getPlayer() then
+        local ok, err = pcall(buildSellList)
+        if not ok then
+            SHOP.sellList = {}
+            toast("Could not read your inventory: " .. tostring(err), false)
+        end
+    end
+    local list = SHOP.sellList or {}
+
+    section("Sell")
+    local w = columnWidth(2)
+    if button("Refresh My Inventory", w) then
+        SHOP.sellList = nil
+        return
+    end
+    ImGui.SameLine()
+    if primaryButton("SELL ALL JUNK", w) then
+        run("Sell junk", function()
+            local total, count = 0, 0
+            for _, entry in ipairs(list) do
+                if entry.junk and entry.qty > 0 then
+                    total = total + sellEntry(entry, entry.qty)
+                    count = count + 1
+                end
+            end
+            if count == 0 then error("you have no junk to sell") end
+            return "Sold " .. count .. " junk items for E$ " .. formatNumber(total)
+        end)
+    end
+
+    beginField("Search your inventory", false)
+    SHOP.sellSearch = ImGui.InputText("##sellsearch", SHOP.sellSearch or "", 100)
+    endField("sellsearch")
+
+    local query = (SHOP.sellSearch or ""):lower()
+    local shown = 0
+    for i, entry in ipairs(list) do
+        if entry.qty > 0 and (query == "" or (entry.name .. " " .. entry.tdbName):lower():find(query, 1, true)) then
+            shown = shown + 1
+            if shown > 80 then break end
+            if primaryButton("SELL 1##sell" .. i, em(5)) then
+                run("Sell", function()
+                    return "Sold " .. entry.name .. " for E$ " .. formatNumber(sellEntry(entry, 1))
+                end)
+            end
+            ImGui.SameLine()
+            if entry.qty > 1 then
+                if button("ALL##sellall" .. i, em(3.5)) then
+                    run("Sell", function()
+                        return "Sold all " .. entry.name .. " for E$ " .. formatNumber(sellEntry(entry, entry.qty))
+                    end)
+                end
+                ImGui.SameLine()
+            end
+            textColored(entry.junk and C.dim or C.text, entry.name .. (entry.qty > 1 and ("  x" .. entry.qty) or ""))
+            ImGui.SameLine()
+            textColored(C.green, entry.price and ("E$ " .. formatNumber(entry.price)) or "no price")
+        end
+    end
+    if shown == 0 then hint("Nothing to sell here.") end
+    hint("Equipped gear and quest items are left out so you cannot sell them by accident.")
+end
+
 local function drawShopPage()
+    local mw = columnWidth(2)
+    for i, mode in ipairs({ { "buy", "BUY" }, { "sell", "SELL" } }) do
+        local label = mode[2] .. "##shopmode"
+        if (SHOP.mode or "buy") == mode[1] then
+            primaryButton(label, mw)
+        elseif button(label, mw) then
+            SHOP.mode = mode[1]
+            if mode[1] == "sell" then SHOP.sellList = nil end
+        end
+        if i == 1 then ImGui.SameLine() end
+    end
+    if SHOP.mode == "sell" then
+        drawSellView()
+        return
+    end
+
     -- Load the list for the selected category the first time it is shown.
     if not SHOP.lists[SHOP.cat] and not SHOP.build and not SHOP.failed[SHOP.cat] then
         startShopBuild(SHOP.cat)
@@ -2642,14 +2941,14 @@ local function drawVehiclesPage()
     end
 
     local w = columnWidth(2)
-    if primaryButton("SUMMON VEHICLE", w) then
-        run("Vehicle summoned", function() Game.GetVehicleSystem():SpawnPlayerVehicle() end)
+    if primaryButton("REPAIR & CALL VEHICLE", w) then
+        run("Repair vehicle", reviveVehicle)
     end
     ImGui.SameLine()
     if button("Flip Upright", w) then
         run("Vehicle flipped upright", flipVehicle)
     end
-    hint("If your vehicle is damaged or stuck, summon it again for a fresh one.")
+    hint("Repairs your car once, even after it was wrecked, then calls it to you.")
 
     if button("Open All Doors", w) then
         run("Doors opened", function() setVehicleDoors(true) end)
@@ -2963,8 +3262,6 @@ end
 ---------------------------------------------------------------------------
 
 registerForEvent("onInit", function()
-    -- The damage hook has to exist before saved cheats are restored.
-    NCT.hitHooked = hookHits()
     loadSettings()
     print("[NightCityTrainer] v" .. NCT.version .. " loaded. Open the CET overlay to use it.")
 end)
@@ -3016,8 +3313,27 @@ registerForEvent("onUpdate", function(delta)
         NCT.guardTick = 0
         if getPlayer() then
             if NCT.godMode then pcall(fillPool, gamedataStatPoolType.Health) end
-            if NCT.noFall then pcall(guardFalls) else NCT.fall = nil end
+            if NCT.noFall then
+                pcall(guardFalls)
+            elseif NCT.fall then
+                NCT.fall = nil
+                pcall(setFallShield, false)
+            end
         end
+    end
+
+    NCT.combatTick = (NCT.combatTick or 0) + delta
+    if NCT.combatTick >= 0.1 then
+        NCT.combatTick = 0
+        if getPlayer() then
+            if NCT.oneHit then pcall(oneHitSweep) end
+        end
+    end
+
+    NCT.aggroTick = (NCT.aggroTick or 0) + delta
+    if NCT.aggroTick >= 0.5 then
+        NCT.aggroTick = 0
+        if NCT.invisible and getPlayer() then pcall(dropAggro) end
     end
 
     NCT.lootTick = (NCT.lootTick or 0) + delta
