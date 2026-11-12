@@ -3,7 +3,7 @@
 -- Open the CET overlay in game to show the menu.
 
 local NCT = {
-    version = "4.9.0",
+    version = "4.9.1",
     overlayOpen = false,
     page = "Home",
     tick = 0,
@@ -64,6 +64,10 @@ local SAVED_FIELDS = {
     "movementOn", "cwOn", "xpOn", "speedOn", "skipSpeed", "fovValue", "fovOn", "fovDefault",
     "lootRadius",
 }
+
+-- Pages, menu parts and their helpers live in this table, which keeps the
+-- main chunk under LuaJIT's limit of 200 local variables.
+local UI = {}
 
 local REASON = "NightCityTrainer"
 local INFINITE_AMMO_EFFECT = "GameplayRestriction.InfiniteAmmo"
@@ -664,7 +668,7 @@ end
 -- Vehicles
 ---------------------------------------------------------------------------
 
-local function flipVehicle()
+function UI.flipVehicle()
     local vehicle = requireVehicle()
     local pos = vehicle:GetWorldPosition()
     local angles = playerRotation(vehicle)
@@ -675,7 +679,7 @@ end
 -- Fixes a wrecked personal vehicle once, then calls it to you. This is a single
 -- repair when you press the button, not the old always-on repair that could
 -- throw the car around.
-local function reviveVehicle()
+function UI.reviveVehicle()
     local vehicleSystem = Game.GetVehicleSystem()
     local vehicle = calledVehicle() or lookedAtVehicle() or mountedVehicle()
     local repaired = 0
@@ -698,7 +702,7 @@ local function reviveVehicle()
     return "Vehicle called"
 end
 
-local function setVehicleDoors(open)
+function UI.setVehicleDoors(open)
     local vehicle = requireVehicle()
     local ok = pcall(function()
         local ps = vehicle:GetVehiclePS()
@@ -1752,11 +1756,11 @@ local function cureDebuffs()
     return "Every debuff removed"
 end
 
-local function refillAmmo()
+function UI.refillAmmo()
     for _, name in ipairs(AMMO) do giveItem(name, 999) end
 end
 
-local function drawHomePage()
+function UI.drawHomePage()
     local info = NCT.info or {}
     local function shown(value, money)
         if value == nil then return "--" end
@@ -1796,7 +1800,7 @@ local function drawHomePage()
     end
     ImGui.SameLine()
     if button("Refill Ammo", w) then
-        run("Ammo refilled", refillAmmo)
+        run("Ammo refilled", UI.refillAmmo)
     end
     if button("Kill Enemies Nearby", w) then
         run("Kill enemies", function()
@@ -1810,7 +1814,7 @@ local function drawHomePage()
     end
     ImGui.SameLine()
     if button("Repair & Call Car", w) then
-        run("Repair vehicle", reviveVehicle)
+        run("Repair vehicle", UI.reviveVehicle)
     end
     if button("Quick Save", w) then
         run("Quick save", quickSave)
@@ -1874,7 +1878,7 @@ local function drawHomePage()
     end
 end
 
-local function drawPlayerPage()
+function UI.drawPlayerPage()
     section("Survival")
     cheatToggle("godMode", "God Mode  (take no damage)")
     cheatToggle("infStamina")
@@ -1924,7 +1928,7 @@ local function drawPlayerPage()
     hint("Reset movement before saving if you want a clean save.")
 end
 
-local function drawCombatPage()
+function UI.drawCombatPage()
     section("Ammo")
     cheatToggle("infAmmo", "Infinite Ammo  (no ammo used)")
     if button("Refill Ammo Now", availWidth()) then
@@ -1974,11 +1978,11 @@ local function drawCombatPage()
     hint("Turn damage, armor and cyberware cheats off before saving if you want a clean save.")
 end
 
-local MONEY_PRESETS = {
+UI.MONEY_PRESETS = {
     { "+10K", 10000 }, { "+100K", 100000 }, { "+1M", 1000000 }, { "+10M", 10000000 },
 }
 
-local function drawMoneyPage()
+function UI.drawMoneyPage()
     section("Eddies")
     textColored(C.dim, "Current balance")
     if NCT.info and NCT.info.money then
@@ -1987,14 +1991,14 @@ local function drawMoneyPage()
         textColored(C.dim, "--")
     end
 
-    local w = columnWidth(#MONEY_PRESETS)
-    for i, preset in ipairs(MONEY_PRESETS) do
+    local w = columnWidth(#UI.MONEY_PRESETS)
+    for i, preset in ipairs(UI.MONEY_PRESETS) do
         if primaryButton(preset[1], w) then
             run("Added E$ " .. formatNumber(preset[2]), function()
                 giveItem("Items.money", preset[2])
             end)
         end
-        if i < #MONEY_PRESETS then ImGui.SameLine() end
+        if i < #UI.MONEY_PRESETS then ImGui.SameLine() end
     end
 
     section("Custom Amount")
@@ -2023,7 +2027,7 @@ local ATTRIBUTES = {
 
 local SKILLS = { "CoolSkill", "IntelligenceSkill", "ReflexesSkill", "StrengthSkill", "TechnicalAbilitySkill" }
 
-local function maxSkills()
+function UI.maxSkills()
     local confirmed = 0
     for _, skill in ipairs(SKILLS) do
         if setProficiency(skill, 60) then confirmed = confirmed + 1 end
@@ -2031,7 +2035,7 @@ local function maxSkills()
     return confirmed == #SKILLS
 end
 
-local function maxAttributes()
+function UI.maxAttributes()
     local confirmed = 0
     for _, attr in ipairs(ATTRIBUTES) do
         if setAttribute(attr[2], 20) then confirmed = confirmed + 1 end
@@ -2044,7 +2048,7 @@ end
 ---------------------------------------------------------------------------
 
 -- Skill names as shown in the game, with the game's internal names.
-local SKILL_NAMES = {
+UI.SKILL_NAMES = {
     { "Headhunter", "CoolSkill" },
     { "Netrunner", "IntelligenceSkill" },
     { "Shinobi", "ReflexesSkill" },
@@ -2090,7 +2094,7 @@ local function stepJob()
 end
 
 -- Teaches every crafting recipe in the game, iconic ones included.
-local function unlockAllRecipes(onDone)
+function UI.unlockAllRecipes(onDone)
     if NCT.job then error("another job is still running") end
     local records = TweakDB:GetRecords("gamedataItemRecipe_Record")
     if type(records) ~= "table" or #records == 0 then error("the game would not list its recipes") end
@@ -2114,14 +2118,14 @@ local UPGRADE_MATERIALS = {
     "Items.EpicMaterial1", "Items.LegendaryMaterial1",
 }
 
-local function heldWeaponId()
+function UI.heldWeaponId()
     local item = Game.GetTransactionSystem():GetItemInSlot(getPlayer(), TweakDBID.new("AttachmentSlots.WeaponRight"))
     if not item then error("hold a weapon in your hands first") end
     return item:GetItemID()
 end
 
-local function upgradeHeldWeapon(times)
-    local id = heldWeaponId()
+function UI.upgradeHeldWeapon(times)
+    local id = UI.heldWeaponId()
     for _, name in ipairs(UPGRADE_MATERIALS) do pcall(giveItem, name, 300 * times) end
     local crafting = craftingSystem()
     for _ = 1, times do
@@ -2136,10 +2140,10 @@ local function upgradeHeldWeapon(times)
     return "Upgrade x" .. times .. " sent - check the weapon's tier in your inventory"
 end
 
-local function addSkillXp(amount)
+function UI.addSkillXp(amount)
     local reason = gainReason()
     local given = 0
-    for _, skill in ipairs(SKILL_NAMES) do
+    for _, skill in ipairs(UI.SKILL_NAMES) do
         if pcall(function()
             devData():AddExperience(amount, gamedataProficiencyType[skill[2]], reason, false)
         end) then given = given + 1 end
@@ -2169,7 +2173,7 @@ end
 
 -- Upgrades every piece of cyberware you own, without a ripperdoc. Money and
 -- materials are handed over first so the upgrades cost nothing.
-local function upgradeAllCyberware()
+function UI.upgradeAllCyberware()
     local crafting = craftingSystem()
     local player = getPlayer()
     pcall(giveItem, "Items.money", 500000)
@@ -2195,7 +2199,7 @@ local function upgradeAllCyberware()
     return "Upgrades sent for " .. count .. " cyberware items - check their tier in your inventory"
 end
 
-local function perkTypes()
+function UI.perkTypes()
     local records = TweakDB:GetRecords("gamedataNewPerk_Record")
     if type(records) ~= "table" or #records == 0 then error("the game would not list its perks") end
     local types = {}
@@ -2207,7 +2211,7 @@ local function perkTypes()
     return types
 end
 
-local function perkLevel(data, perkType)
+function UI.perkLevel(data, perkType)
     local level = data:IsNewPerkBought(perkType)
     if type(level) == "boolean" then return level and 1 or 0 end
     return tonumber(level) or 0
@@ -2215,10 +2219,10 @@ end
 
 -- Buys every perk to its highest level, relic perks included. Attributes are
 -- maxed and plenty of points handed over first, because perks require both.
-local function maxAllPerks(onDone)
+function UI.maxAllPerks(onDone)
     if NCT.job then error("another job is still running") end
-    local types = perkTypes()
-    pcall(maxAttributes)
+    local types = UI.perkTypes()
+    pcall(UI.maxAttributes)
     pcall(addDevPoints, "Primary", 1000, "perk")
     pcall(addDevPoints, "Espionage", 100, "relic")
     -- Three passes, so perks that need a parent perk get bought after it.
@@ -2230,13 +2234,13 @@ local function maxAllPerks(onDone)
         local data = devData()
         local maxLevel = 1
         pcall(function() maxLevel = data:GetNewPerkMaxLevel(perkType) end)
-        local before = perkLevel(data, perkType)
+        local before = UI.perkLevel(data, perkType)
         local level = before
         for _ = 1, maxLevel do
             if level >= maxLevel then break end
             pcall(function() data:UnlockNewPerk(perkType) end)
             data:BuyNewPerk(perkType, true)
-            local now = perkLevel(data, perkType)
+            local now = UI.perkLevel(data, perkType)
             if now <= level then break end
             level = now
         end
@@ -2247,22 +2251,22 @@ end
 
 -- One button for everything: level, street cred, skills, attributes, cyberware,
 -- capacity, then every perk, then every recipe.
-local function maxEverything()
+function UI.maxEverything()
     if NCT.job then error("another job is still running") end
     pcall(setProficiency, "Level", 60)
     pcall(setProficiency, "StreetCred", 50)
-    pcall(maxSkills)
+    pcall(UI.maxSkills)
     pcall(function()
         NCT.cwCapacity = math.max(NCT.cwCapacity, 300)
         applyCyberwareCapacity()
     end)
-    pcall(upgradeAllCyberware)
-    maxAllPerks(function() pcall(unlockAllRecipes) end)
+    pcall(UI.upgradeAllCyberware)
+    UI.maxAllPerks(function() pcall(UI.unlockAllRecipes) end)
     return "Maxing everything: level, cred, skills, attributes, cyberware, then every perk and recipe..."
 end
 
 -- Refunds spent perk or attribute points, and reports how many points you have now.
-local function respec(kind)
+function UI.respec(kind)
     local data = devData()
     local pointType = kind == "attributes" and "Attribute" or "Primary"
     local before = getDevPoints(pointType)
@@ -2283,13 +2287,13 @@ local function respec(kind)
     return name .. " reset requested - check the character menu"
 end
 
-local function drawProgressPage()
+function UI.drawProgressPage()
     local info = NCT.info or {}
     local apply
 
     section("One Click")
     if primaryButton("MAX OUT EVERYTHING", availWidth()) then
-        run("Max out everything", maxEverything)
+        run("Max out everything", UI.maxEverything)
     end
     hint("Level 60, street cred 50, every skill 60, every attribute 20, every perk, every cyberware "
         .. "upgraded, +300 cyberware capacity and every crafting recipe.")
@@ -2301,11 +2305,11 @@ local function drawProgressPage()
     end
     local pw2 = columnWidth(2)
     if button("Max All Perks", pw2) then
-        run("Max all perks", function() return maxAllPerks() end)
+        run("Max all perks", function() return UI.maxAllPerks() end)
     end
     ImGui.SameLine()
     if button("Upgrade All Cyberware", pw2) then
-        run("Upgrade cyberware", upgradeAllCyberware)
+        run("Upgrade cyberware", UI.upgradeAllCyberware)
     end
 
     section("Points")
@@ -2395,8 +2399,8 @@ local function drawProgressPage()
 
     section("Skills")
     NCT.skillValue = sliderInt("skillval", "Set skill to", NCT.skillValue, 1, 60)
-    local sw = columnWidth(#SKILL_NAMES)
-    for i, skill in ipairs(SKILL_NAMES) do
+    local sw = columnWidth(#UI.SKILL_NAMES)
+    for i, skill in ipairs(UI.SKILL_NAMES) do
         if button(skill[1] .. "##skill", sw) then
             run("Set " .. skill[1], function()
                 if setProficiency(skill[2], NCT.skillValue) then
@@ -2405,16 +2409,16 @@ local function drawProgressPage()
                 return skill[1] .. " change requested - check the character menu"
             end)
         end
-        if i < #SKILL_NAMES then ImGui.SameLine() end
+        if i < #UI.SKILL_NAMES then ImGui.SameLine() end
     end
     local kw = columnWidth(2)
     if button("+5,000 XP To Every Skill", kw) then
-        run("Skill XP", function() return addSkillXp(5000) end)
+        run("Skill XP", function() return UI.addSkillXp(5000) end)
     end
     ImGui.SameLine()
     if button("Max All Skills  (60)", kw) then
         run("Max all skills", function()
-            if maxSkills() then return "All 5 skills set to 60" end
+            if UI.maxSkills() then return "All 5 skills set to 60" end
             return "Skill changes requested - check the character menu"
         end)
     end
@@ -2422,7 +2426,7 @@ local function drawProgressPage()
 
     section("Crafting & Gear")
     if primaryButton("UNLOCK ALL CRAFTING RECIPES", availWidth()) then
-        run("Unlock recipes", function() return unlockAllRecipes() end)
+        run("Unlock recipes", function() return UI.unlockAllRecipes() end)
     end
     local job = NCT.job
     if job then
@@ -2431,11 +2435,11 @@ local function drawProgressPage()
     end
     local uw = columnWidth(2)
     if button("Upgrade Held Weapon  (+1)", uw) then
-        run("Upgrade weapon", function() return upgradeHeldWeapon(1) end)
+        run("Upgrade weapon", function() return UI.upgradeHeldWeapon(1) end)
     end
     ImGui.SameLine()
     if button("Max Upgrade Held Weapon", uw) then
-        run("Upgrade weapon", function() return upgradeHeldWeapon(10) end)
+        run("Upgrade weapon", function() return UI.upgradeHeldWeapon(10) end)
     end
     hint("Upgrades the weapon in your hands for free: the materials are handed to you first.")
 
@@ -2455,7 +2459,7 @@ local function drawProgressPage()
     end
     if button("Max All Attributes  (20)", availWidth()) then
         run("Max all attributes", function()
-            if maxAttributes() then return "All attributes set to 20" end
+            if UI.maxAttributes() then return "All attributes set to 20" end
             return "Attribute changes requested - check the character menu"
         end)
     end
@@ -2463,24 +2467,24 @@ local function drawProgressPage()
     section("Free Respec")
     local rw = columnWidth(2)
     if button("Reset Perks", rw) then
-        run("Reset perks", function() return respec("perks") end)
+        run("Reset perks", function() return UI.respec("perks") end)
     end
     ImGui.SameLine()
     if button("Reset Attributes", rw) then
-        run("Reset attributes", function() return respec("attributes") end)
+        run("Reset attributes", function() return UI.respec("attributes") end)
     end
     hint("Refunds your points so you can spend them again, at no cost.")
 end
 
-local MATERIALS = {
+UI.MATERIALS = {
     "Items.CommonMaterial1", "Items.UncommonMaterial1", "Items.RareMaterial1",
     "Items.EpicMaterial1", "Items.LegendaryMaterial1",
 }
-local HACK_MATERIALS = {
+UI.HACK_MATERIALS = {
     "Items.QuickHackUncommonMaterial1", "Items.QuickHackRareMaterial1",
     "Items.QuickHackEpicMaterial1", "Items.QuickHackLegendaryMaterial1",
 }
-local ICONICS = {
+UI.ICONICS = {
     { "Satori (katana)", "Items.Preset_Katana_Saburo" },
     { "Malorian Arms 3516", "Items.Preset_Silverhand_3516" },
     { "Skippy (smart pistol)", "Items.mq007_skippy" },
@@ -2492,7 +2496,7 @@ local ICONICS = {
 }
 
 -- Gives every item in a list; returns how many were accepted by the game.
-local function giveList(names, qty)
+function UI.giveList(names, qty)
     local given = 0
     for _, name in ipairs(names) do
         if pcall(giveItemChecked, name, qty) then given = given + 1 end
@@ -2501,42 +2505,42 @@ local function giveList(names, qty)
     return given
 end
 
-local function drawItemsPage()
+function UI.drawItemsPage()
     section("Quick Packs")
     NCT.matQty = inputInt("matqty", "Quantity of each", NCT.matQty, 1, 100000, 100)
 
     local w = columnWidth(3)
     if primaryButton("CRAFTING PARTS", w) then
         run("Give crafting components", function()
-            local n = giveList(MATERIALS, NCT.matQty)
-            return "Gave " .. n .. " of " .. #MATERIALS .. " crafting component types x" .. NCT.matQty
+            local n = UI.giveList(UI.MATERIALS, NCT.matQty)
+            return "Gave " .. n .. " of " .. #UI.MATERIALS .. " crafting component types x" .. NCT.matQty
         end)
     end
     ImGui.SameLine()
     if primaryButton("QUICKHACK PARTS", w) then
         run("Give quickhack components", function()
-            local n = giveList(HACK_MATERIALS, NCT.matQty)
-            return "Gave " .. n .. " of " .. #HACK_MATERIALS .. " quickhack component types x" .. NCT.matQty
+            local n = UI.giveList(UI.HACK_MATERIALS, NCT.matQty)
+            return "Gave " .. n .. " of " .. #UI.HACK_MATERIALS .. " quickhack component types x" .. NCT.matQty
         end)
     end
     ImGui.SameLine()
     if primaryButton("AMMO", w) then
         run("Give ammo", function()
-            local n = giveList(AMMO, NCT.matQty)
+            local n = UI.giveList(AMMO, NCT.matQty)
             return "Gave " .. n .. " of " .. #AMMO .. " ammo types x" .. NCT.matQty
         end)
     end
 
     section("Iconic Weapons")
     w = columnWidth(2)
-    for i, weapon in ipairs(ICONICS) do
+    for i, weapon in ipairs(UI.ICONICS) do
         if button(weapon[1], w) then
             run("Give " .. weapon[1], function()
                 giveItemChecked(weapon[2], 1)
                 return "Added " .. weapon[1] .. " to your inventory"
             end)
         end
-        if i % 2 == 1 and i < #ICONICS then ImGui.SameLine() end
+        if i % 2 == 1 and i < #UI.ICONICS then ImGui.SameLine() end
     end
 
     section("Spawn Any Item")
@@ -2556,7 +2560,7 @@ local function drawItemsPage()
     hint("Example: Items.Preset_Lexington_Default. A red message means the ID does not exist.")
 end
 
-local WEATHER = {
+UI.WEATHER = {
     { "Sunny", "24h_weather_sunny" },
     { "Cloudy", "24h_weather_cloudy" },
     { "Rain", "24h_weather_rain" },
@@ -2567,27 +2571,27 @@ local WEATHER = {
     { "Heavy Clouds", "24h_weather_heavy_clouds" },
 }
 
-local TIMES = { { "Dawn", 6 }, { "Noon", 12 }, { "Dusk", 19 }, { "Midnight", 0 } }
+UI.TIMES = { { "Dawn", 6 }, { "Noon", 12 }, { "Dusk", 19 }, { "Midnight", 0 } }
 
-local function setHour(hour)
+function UI.setHour(hour)
     Game.GetTimeSystem():SetGameTimeByHMS(hour, 0, 0)
 end
 
-local function drawWorldPage()
+function UI.drawWorldPage()
     local apply
 
     section("Time")
-    local w = columnWidth(#TIMES)
-    for i, preset in ipairs(TIMES) do
+    local w = columnWidth(#UI.TIMES)
+    for i, preset in ipairs(UI.TIMES) do
         if button(preset[1], w) then
             NCT.hour = preset[2]
-            run(string.format("Time set to %02d:00", preset[2]), function() setHour(preset[2]) end)
+            run(string.format("Time set to %02d:00", preset[2]), function() UI.setHour(preset[2]) end)
         end
-        if i < #TIMES then ImGui.SameLine() end
+        if i < #UI.TIMES then ImGui.SameLine() end
     end
     NCT.hour, apply = sliderInt("hour", "Hour of day", NCT.hour, 0, 23, "SET")
     if apply then
-        run(string.format("Time set to %02d:00", NCT.hour), function() setHour(NCT.hour) end)
+        run(string.format("Time set to %02d:00", NCT.hour), function() UI.setHour(NCT.hour) end)
     end
     cheatToggle("freezeClock")
     textColored(C.dim, "Skip time")
@@ -2653,13 +2657,13 @@ local function drawWorldPage()
 
     section("Weather")
     w = columnWidth(4)
-    for i, weather in ipairs(WEATHER) do
+    for i, weather in ipairs(UI.WEATHER) do
         if button(weather[1], w) then
             run("Weather: " .. weather[1], function()
                 Game.GetWeatherSystem():SetWeather(CName.new(weather[2]), 5.0, 9)
             end)
         end
-        if i % 4 ~= 0 and i < #WEATHER then ImGui.SameLine() end
+        if i % 4 ~= 0 and i < #UI.WEATHER then ImGui.SameLine() end
     end
     if button("Reset Weather", availWidth()) then
         run("Weather reset", function() Game.GetWeatherSystem():ResetWeather(true) end)
@@ -2711,7 +2715,7 @@ local SHOP = {
 }
 
 -- Test, NPC-only and internal items are hidden from the shop.
-local function junkItem(id)
+function UI.junkItem(id)
     local l = id:lower()
     return not l:find("^items%.") or l:find("npc") or l:find("items%.base_") or l:find("[_%.]test")
         or l:find("debug") or l:find("dummy") or l:find("_dev[_%.]") or l:find("^items%.q%d%d%d_test")
@@ -2748,7 +2752,7 @@ local function stepShopBuild()
         pcall(function()
             local record = job.records[i]
             local id = TDBID.ToStringDEBUG(record:GetID())
-            if type(id) ~= "string" or junkItem(id) then return end
+            if type(id) ~= "string" or UI.junkItem(id) then return end
             local name = Game.GetLocalizedTextByKey(record:DisplayName())
             if type(name) ~= "string" or name == "" or #name > 70 then return end
             local iconic = false
@@ -2775,7 +2779,7 @@ local function stepShopBuild()
     end
 end
 
-local function shopFiltered()
+function UI.shopFiltered()
     local list = SHOP.lists[SHOP.cat]
     if not list then return nil end
     local key = SHOP.cat .. "|" .. SHOP.search:lower()
@@ -2811,7 +2815,7 @@ local function itemPrice(id)
     return priceOf(itemID(id))
 end
 
-local function shopAdd(entry, qty)
+function UI.shopAdd(entry, qty)
     local cost = 0
     if SHOP.pay then
         local price = itemPrice(entry.id)
@@ -2830,11 +2834,11 @@ local function shopAdd(entry, qty)
     return "Added " .. entry.name .. (qty > 1 and (" x" .. qty) or "")
 end
 
-local function startBulk(label, ids)
+function UI.startBulk(label, ids)
     SHOP.bulk = { label = label, ids = ids, index = 1, given = 0, failed = 0 }
 end
 
-local function stepBulk()
+function UI.stepBulk()
     local job = SHOP.bulk
     if not job then return end
     if not getPlayer() then
@@ -2858,7 +2862,7 @@ local function stepBulk()
     end
 end
 
-local function bulkAdd(catName, label, predicate)
+function UI.bulkAdd(catName, label, predicate)
     if SHOP.bulk then
         toast("A bulk add is already running.", false)
         return
@@ -2876,12 +2880,12 @@ local function bulkAdd(catName, label, predicate)
             toast(label .. ": nothing found to add.", false)
             return
         end
-        startBulk(label, ids)
+        UI.startBulk(label, ids)
     end)
 end
 
 -- Selling: what you own, minus equipped gear, quest items and money.
-local function buildSellList()
+function UI.buildSellList()
     local player = getPlayer()
     local equipment = Game.GetScriptableSystemsContainer():Get(CName.new("EquipmentSystem"))
     local list = {}
@@ -2910,7 +2914,7 @@ local function buildSellList()
     SHOP.sellList = list
 end
 
-local function sellEntry(entry, qty)
+function UI.sellEntry(entry, qty)
     qty = math.min(qty, entry.qty)
     if qty <= 0 then error("you have none left") end
     local price = entry.price or 0
@@ -2920,9 +2924,9 @@ local function sellEntry(entry, qty)
     return price * qty
 end
 
-local function drawSellView()
+function UI.drawSellView()
     if not SHOP.sellList and getPlayer() then
-        local ok, err = pcall(buildSellList)
+        local ok, err = pcall(UI.buildSellList)
         if not ok then
             SHOP.sellList = {}
             toast("Could not read your inventory: " .. tostring(err), false)
@@ -2942,7 +2946,7 @@ local function drawSellView()
             local total, count = 0, 0
             for _, entry in ipairs(list) do
                 if entry.junk and entry.qty > 0 then
-                    total = total + sellEntry(entry, entry.qty)
+                    total = total + UI.sellEntry(entry, entry.qty)
                     count = count + 1
                 end
             end
@@ -2963,14 +2967,14 @@ local function drawSellView()
             if shown > 80 then break end
             if primaryButton("SELL 1##sell" .. i, em(5)) then
                 run("Sell", function()
-                    return "Sold " .. entry.name .. " for E$ " .. formatNumber(sellEntry(entry, 1))
+                    return "Sold " .. entry.name .. " for E$ " .. formatNumber(UI.sellEntry(entry, 1))
                 end)
             end
             ImGui.SameLine()
             if entry.qty > 1 then
                 if button("ALL##sellall" .. i, em(3.5)) then
                     run("Sell", function()
-                        return "Sold all " .. entry.name .. " for E$ " .. formatNumber(sellEntry(entry, entry.qty))
+                        return "Sold all " .. entry.name .. " for E$ " .. formatNumber(UI.sellEntry(entry, entry.qty))
                     end)
                 end
                 ImGui.SameLine()
@@ -2984,7 +2988,7 @@ local function drawSellView()
     hint("Equipped gear and quest items are left out so you cannot sell them by accident.")
 end
 
-local function drawShopPage()
+function UI.drawShopPage()
     local mw = columnWidth(2)
     for i, mode in ipairs({ { "buy", "BUY" }, { "sell", "SELL" } }) do
         local label = mode[2] .. "##shopmode"
@@ -2997,7 +3001,7 @@ local function drawShopPage()
         if i == 1 then ImGui.SameLine() end
     end
     if SHOP.mode == "sell" then
-        drawSellView()
+        UI.drawSellView()
         return
     end
 
@@ -3011,15 +3015,15 @@ local function drawShopPage()
     local w = columnWidth(3)
     if SHOP.confirmBulk then
         if primaryButton("ALL WEAPONS", w) then
-            bulkAdd("Weapons", "All weapons")
+            UI.bulkAdd("Weapons", "All weapons")
         end
         ImGui.SameLine()
         if primaryButton("ICONIC WEAPONS", w) then
-            bulkAdd("Weapons", "Iconic weapons", function(e) return e.iconic end)
+            UI.bulkAdd("Weapons", "Iconic weapons", function(e) return e.iconic end)
         end
         ImGui.SameLine()
         if primaryButton("ALL CLOTHING", w) then
-            bulkAdd("Clothing", "All clothing")
+            UI.bulkAdd("Clothing", "All clothing")
         end
     else
         hint("Tick the box to enable the buttons.")
@@ -3069,14 +3073,14 @@ local function drawShopPage()
         return
     end
 
-    local results = shopFiltered() or {}
+    local results = UI.shopFiltered() or {}
     local shown = math.min(#results, SHOP.limit)
     textColored(C.dim, string.format("%d found, showing %d", #results, shown))
 
     for i = 1, shown do
         local entry = results[i]
         if primaryButton((SHOP.pay and "BUY" or "ADD") .. "##shop" .. i, em(4)) then
-            run("Shop", function() return shopAdd(entry, SHOP.qty) end)
+            run("Shop", function() return UI.shopAdd(entry, SHOP.qty) end)
         end
         ImGui.SameLine()
         textColored(entry.iconic and C.yellow or C.text, entry.name)
@@ -3104,7 +3108,7 @@ end
 ---------------------------------------------------------------------------
 
 -- Adds a piece of clothing to the wardrobe without putting it in your inventory.
-local function addToWardrobe(name)
+function UI.addToWardrobe(name)
     local id = ItemID.FromTDBID(TweakDBID.new(name))
     local attempts = {
         function() Game.GetWardrobeSystem():StoreUniqueItemIDAndMarkNew(id) end,
@@ -3118,20 +3122,20 @@ local function addToWardrobe(name)
     error("the wardrobe would not take " .. name)
 end
 
-local function unlockWardrobe()
+function UI.unlockWardrobe()
     if NCT.job then error("another job is still running") end
     startShopBuild("Clothing", function(list)
         local names = {}
         for _, entry in ipairs(list) do names[#names + 1] = entry.id end
-        startJob("Wardrobe", names, addToWardrobe)
+        startJob("Wardrobe", names, UI.addToWardrobe)
     end)
     return "Adding every outfit piece to your wardrobe..."
 end
 
-local HUD_PATH = "/interface/hud"
-local VISUAL_PATH = "/graphics/basic"
+UI.HUD_PATH = "/interface/hud"
+UI.VISUAL_PATH = "/graphics/basic"
 
-local function drawSettingsGroup(path, idPrefix)
+function UI.drawSettingsGroup(path, idPrefix)
     local list = boolSettings(path)
     if #list == 0 then
         hint("The game did not list these settings.")
@@ -3150,24 +3154,24 @@ local function drawSettingsGroup(path, idPrefix)
     end
 end
 
-local function drawStylePage()
+function UI.drawStylePage()
     section("HUD")
     local w = columnWidth(2)
     if primaryButton("HIDE ALL HUD", w) then
         run("Hide HUD", function()
-            setBoolGroup(HUD_PATH, false)
+            setBoolGroup(UI.HUD_PATH, false)
             return "HUD hidden - press SHOW ALL HUD or the hotkey to bring it back"
         end)
     end
     ImGui.SameLine()
     if button("Show All HUD", w) then
         run("Show HUD", function()
-            setBoolGroup(HUD_PATH, true)
+            setBoolGroup(UI.HUD_PATH, true)
             return "HUD shown"
         end)
     end
     hint("Or switch single parts on and off below. These are the game's own HUD settings.")
-    drawSettingsGroup(HUD_PATH, "hud")
+    UI.drawSettingsGroup(UI.HUD_PATH, "hud")
 
     section("Photo Tools")
     local pw = columnWidth(3)
@@ -3181,7 +3185,7 @@ local function drawStylePage()
     ImGui.SameLine()
     if button("Clean Screenshot", pw) then
         run("Clean screenshot", function()
-            setBoolGroup(HUD_PATH, false)
+            setBoolGroup(UI.HUD_PATH, false)
             applyGameSpeed(0.02)
             return "HUD hidden and world frozen - press Unfreeze and Show All HUD when done"
         end)
@@ -3190,11 +3194,11 @@ local function drawStylePage()
 
     section("Visual Effects")
     hint("Turn film grain, chromatic aberration, lens flare, motion blur and the like on or off.")
-    drawSettingsGroup(VISUAL_PATH, "gfx")
+    UI.drawSettingsGroup(UI.VISUAL_PATH, "gfx")
 
     section("Wardrobe")
     if primaryButton("UNLOCK EVERY OUTFIT PIECE", availWidth()) then
-        run("Unlock wardrobe", unlockWardrobe)
+        run("Unlock wardrobe", UI.unlockWardrobe)
     end
     local job = NCT.job
     if job then
@@ -3205,7 +3209,7 @@ local function drawStylePage()
         .. "your inventory. To own a piece for real, use the Clothing tab of the Shop page.")
 end
 
-local HERO_VEHICLES = {
+UI.HERO_VEHICLES = {
     { "Rayfield Caliburn", "Vehicle.v_sport1_rayfield_caliburn_player" },
     { "Rayfield Aerondight", "Vehicle.v_sport1_rayfield_aerondight_player" },
     { "Quadra Type-66 Avenger", "Vehicle.v_sport2_quadra_type66_avenger_player" },
@@ -3214,7 +3218,7 @@ local HERO_VEHICLES = {
     { "Jackie's Arch (bike)", "Vehicle.v_sportbike2_arch_jackie_player" },
 }
 
-local function drawVehiclesPage()
+function UI.drawVehiclesPage()
     section("Current Vehicle")
     -- Looked up at most once a second, not on every frame.
     if not NCT.vehicleLook or os.clock() - NCT.vehicleLook.time >= 1 then
@@ -3233,20 +3237,20 @@ local function drawVehiclesPage()
 
     local w = columnWidth(2)
     if primaryButton("REPAIR & CALL VEHICLE", w) then
-        run("Repair vehicle", reviveVehicle)
+        run("Repair vehicle", UI.reviveVehicle)
     end
     ImGui.SameLine()
     if button("Flip Upright", w) then
-        run("Vehicle flipped upright", flipVehicle)
+        run("Vehicle flipped upright", UI.flipVehicle)
     end
     hint("Repairs your car once, even after it was wrecked, then calls it to you.")
 
     if button("Open All Doors", w) then
-        run("Doors opened", function() setVehicleDoors(true) end)
+        run("Doors opened", function() UI.setVehicleDoors(true) end)
     end
     ImGui.SameLine()
     if button("Close All Doors", w) then
-        run("Doors closed", function() setVehicleDoors(false) end)
+        run("Doors closed", function() UI.setVehicleDoors(false) end)
     end
 
     if button("Next Radio Station", w) then
@@ -3264,7 +3268,7 @@ local function drawVehiclesPage()
 
     section("Dream Garage")
     hint("Adds the vehicle to your owned list, ready to call from the vehicle menu.")
-    for i, car in ipairs(HERO_VEHICLES) do
+    for i, car in ipairs(UI.HERO_VEHICLES) do
         if button(car[1] .. "##hero" .. i, w) then
             run("Add " .. car[1], function()
                 if not TweakDB:GetRecord(TweakDBID.new(car[2])) then
@@ -3274,7 +3278,7 @@ local function drawVehiclesPage()
                 return car[1] .. " added to your vehicles"
             end)
         end
-        if i % 2 == 1 and i < #HERO_VEHICLES then ImGui.SameLine() end
+        if i % 2 == 1 and i < #UI.HERO_VEHICLES then ImGui.SameLine() end
     end
 
     section("Garage")
@@ -3289,7 +3293,7 @@ local function drawVehiclesPage()
     hint("Unlocking is permanent for the save it is used on.")
 end
 
-local function drawTeleportPage()
+function UI.drawTeleportPage()
     section("Fly Mode")
     cheatToggle("fly", "Fly Mode  (no clip)")
     NCT.flySpeed = sliderInt("flyspeed", "Fly speed in metres per second", NCT.flySpeed, 5, 100)
@@ -3348,7 +3352,7 @@ local function drawTeleportPage()
     end
 end
 
-local function unlockAllAchievements()
+function UI.unlockAllAchievements()
     local system = Game.GetAchievementSystem()
     local records = TweakDB:GetRecords("gamedataAchievement_Record")
     local count = 0
@@ -3363,7 +3367,7 @@ local function unlockAllAchievements()
     return count
 end
 
-local function drawAchievementsPage()
+function UI.drawAchievementsPage()
     section("Steam Achievements")
     hint("Unlocks every achievement the game knows about on your Steam account.")
     warn("This is permanent. Steam has no way to re-lock them.")
@@ -3372,7 +3376,7 @@ local function drawAchievementsPage()
     if NCT.achConfirm then
         if primaryButton("UNLOCK ALL ACHIEVEMENTS", availWidth()) then
             run("Unlock achievements", function()
-                return "Sent " .. unlockAllAchievements() .. " achievements to Steam"
+                return "Sent " .. UI.unlockAllAchievements() .. " achievements to Steam"
             end)
             NCT.achConfirm = false
         end
@@ -3380,7 +3384,7 @@ local function drawAchievementsPage()
     hint("Steam can take a minute to show them. Check your profile afterwards.")
 end
 
-local HOTKEY_HELP = {
+UI.HOTKEY_HELP = {
     "Add E$ 100,000", "Heal to full", "Refill ammo", "Clear wanted level",
     "Toggle God Mode", "Toggle Infinite Ammo", "Toggle Slow Motion", "Toggle Fly Mode",
     "Flip vehicle upright", "Kill hostile enemies nearby", "Toggle Auto Skip Cutscenes",
@@ -3390,7 +3394,7 @@ local HOTKEY_HELP = {
     "Fly: forward / back / left / right / up / down  (hold)",
 }
 
-local function drawSettingsPage()
+function UI.drawSettingsPage()
     section("Trainer")
     local v, changed = ImGui.Checkbox("Remember my cheats between sessions", NCT.rememberCheats)
     if changed then
@@ -3420,7 +3424,7 @@ local function drawSettingsPage()
 
     section("Hotkeys")
     hint("Bind these in the CET overlay under Bindings > NightCityTrainer:")
-    for _, line in ipairs(HOTKEY_HELP) do
+    for _, line in ipairs(UI.HOTKEY_HELP) do
         textColored(C.text, "  - " .. line)
     end
 end
@@ -3430,7 +3434,7 @@ end
 -- test-report.txt next to itself so it can be read and fixed.
 ---------------------------------------------------------------------------
 
-local CHECKLIST = {
+UI.CHECKLIST = {
     { "Player", {
         "God Mode (no damage, explosions too)", "Infinite Stamina", "Infinite Oxygen", "Infinite RAM",
         "Rapid Health Regen", "Status Immunity", "No Fall Damage (high falls too)", "Double Jump",
@@ -3469,19 +3473,19 @@ local CHECKLIST = {
     } },
 }
 
-local CHECK_LABELS = { ok = "WORKS", bad = "BROKEN", skip = "SKIPPED" }
+UI.CHECK_LABELS = { ok = "WORKS", bad = "BROKEN", skip = "SKIPPED" }
 
 -- Builds the report text and the totals, without writing anything.
-local function buildReport()
+function UI.buildReport()
     local lines = {}
     local counts = { ok = 0, bad = 0, skip = 0, none = 0 }
-    for _, group in ipairs(CHECKLIST) do
+    for _, group in ipairs(UI.CHECKLIST) do
         lines[#lines + 1] = "[" .. group[1] .. "]"
         for _, item in ipairs(group[2]) do
             local entry = NCT.checklist[item]
             local state = entry and entry.state or "none"
             counts[state] = (counts[state] or 0) + 1
-            local line = string.format("  %-11s %s", CHECK_LABELS[state] or "NOT TESTED", item)
+            local line = string.format("  %-11s %s", UI.CHECK_LABELS[state] or "NOT TESTED", item)
             if entry and entry.note and entry.note ~= "" then line = line .. "   -- " .. entry.note end
             lines[#lines + 1] = line
         end
@@ -3497,8 +3501,8 @@ local function buildReport()
 end
 
 -- Saves the report to test-report.txt. Called only when an answer changes.
-local function writeReport()
-    local text, counts = buildReport()
+function UI.writeReport()
+    local text, counts = UI.buildReport()
     pcall(function()
         local file = io.open("test-report.txt", "w")
         if file then
@@ -3509,7 +3513,7 @@ local function writeReport()
     return text, counts
 end
 
-local function choiceButton(label, active, color, width)
+function UI.choiceButton(label, active, color, width)
     if active then
         ImGui.PushStyleColor(ImGuiCol.Button, color[1], color[2], color[3], 0.85)
         ImGui.PushStyleColor(ImGuiCol.ButtonHovered, color[1], color[2], color[3], 1)
@@ -3520,8 +3524,8 @@ local function choiceButton(label, active, color, width)
     return pressed
 end
 
-local function drawChecklistPage()
-    local _, counts = buildReport()
+function UI.drawChecklistPage()
+    local _, counts = UI.buildReport()
     section("Test Checklist")
     hint("Try each feature in the game, then mark it. Your answers are saved straight away to "
         .. "test-report.txt in the trainer's folder, so they can be read and fixed. Add a note for anything broken.")
@@ -3529,7 +3533,7 @@ local function drawChecklistPage()
         counts.ok, counts.bad, counts.skip, counts.none))
     local w = columnWidth(2)
     if button("Copy Report", w) then
-        local text = writeReport()
+        local text = UI.writeReport()
         if pcall(ImGui.SetClipboardText, text) then
             toast("Report copied - paste it in the chat", true)
         else
@@ -3539,12 +3543,12 @@ local function drawChecklistPage()
     ImGui.SameLine()
     if dangerButton("Clear All Answers", w) then
         NCT.checklist = {}
-        writeReport()
+        UI.writeReport()
         toast("Checklist cleared", true)
     end
 
     local bw = em(5.2)
-    for _, group in ipairs(CHECKLIST) do
+    for _, group in ipairs(UI.CHECKLIST) do
         section(group[1])
         for i, item in ipairs(group[2]) do
             local entry = NCT.checklist[item] or {}
@@ -3552,13 +3556,13 @@ local function drawChecklistPage()
             local function mark(state)
                 if entry.state == state then entry.state = nil else entry.state = state end
                 NCT.checklist[item] = entry
-                writeReport()
+                UI.writeReport()
             end
-            if choiceButton("Works##ok" .. id, entry.state == "ok", C.green, bw) then mark("ok") end
+            if UI.choiceButton("Works##ok" .. id, entry.state == "ok", C.green, bw) then mark("ok") end
             ImGui.SameLine()
-            if choiceButton("Broken##bad" .. id, entry.state == "bad", C.red, bw) then mark("bad") end
+            if UI.choiceButton("Broken##bad" .. id, entry.state == "bad", C.red, bw) then mark("bad") end
             ImGui.SameLine()
-            if choiceButton("Skip##skip" .. id, entry.state == "skip", C.dim, bw) then mark("skip") end
+            if UI.choiceButton("Skip##skip" .. id, entry.state == "skip", C.dim, bw) then mark("skip") end
             ImGui.SameLine()
             local color = entry.state == "ok" and C.green or (entry.state == "bad" and C.red or C.text)
             textColored(color, item)
@@ -3569,7 +3573,7 @@ local function drawChecklistPage()
                 if type(note) == "string" and note ~= (entry.note or "") then
                     entry.note = note
                     NCT.checklist[item] = entry
-                    writeReport()
+                    UI.writeReport()
                 end
                 if (entry.note or "") == "" then hint("What went wrong? (optional)") end
             end
@@ -3579,20 +3583,20 @@ end
 
 -- name, draw function, icon name (from CET's bundled icon font)
 local PAGES = {
-    { "Home", drawHomePage, "Home" },
-    { "Player", drawPlayerPage, "Account" },
-    { "Combat", drawCombatPage, "Sword" },
-    { "Money", drawMoneyPage, "Cash" },
-    { "Progress", drawProgressPage, "TrendingUp" },
-    { "Shop", drawShopPage, "Cart" },
-    { "Items", drawItemsPage, "PackageVariant" },
-    { "Style", drawStylePage, "Palette" },
-    { "Vehicles", drawVehiclesPage, "Car" },
-    { "World", drawWorldPage, "Earth" },
-    { "Teleport", drawTeleportPage, "MapMarker" },
-    { "Achievements", drawAchievementsPage, "Trophy" },
-    { "Settings", drawSettingsPage, "Cog" },
-    { "Test", drawChecklistPage, "ClipboardCheck" },
+    { "Home", UI.drawHomePage, "Home" },
+    { "Player", UI.drawPlayerPage, "Account" },
+    { "Combat", UI.drawCombatPage, "Sword" },
+    { "Money", UI.drawMoneyPage, "Cash" },
+    { "Progress", UI.drawProgressPage, "TrendingUp" },
+    { "Shop", UI.drawShopPage, "Cart" },
+    { "Items", UI.drawItemsPage, "PackageVariant" },
+    { "Style", UI.drawStylePage, "Palette" },
+    { "Vehicles", UI.drawVehiclesPage, "Car" },
+    { "World", UI.drawWorldPage, "Earth" },
+    { "Teleport", UI.drawTeleportPage, "MapMarker" },
+    { "Achievements", UI.drawAchievementsPage, "Trophy" },
+    { "Settings", UI.drawSettingsPage, "Cog" },
+    { "Test", UI.drawChecklistPage, "ClipboardCheck" },
 }
 
 local function pageIcon(name)
@@ -3606,7 +3610,7 @@ end
 ---------------------------------------------------------------------------
 
 -- A rounded label with text inside. Returns its width.
-local function pill(dl, x, y, text, fg, bg, dot)
+function UI.pill(dl, x, y, text, fg, bg, dot)
     local pad = em(0.55)
     local extra = dot and em(0.8) or 0
     local w = textWidth(text) + pad * 2 + extra
@@ -3623,7 +3627,7 @@ end
 
 -- Banner across the top: title, live status pills, and a light that sweeps
 -- along the bottom edge.
-local function drawFancyHeader()
+function UI.drawFancyHeader()
     local dl = ImGui.GetWindowDrawList()
     local x, y = ImGui.GetCursorScreenPos()
     local w = availWidth()
@@ -3647,18 +3651,18 @@ local function drawFancyHeader()
     local gap = em(0.4)
     local info = NCT.info
     if info then
-        px = px + pill(dl, px, py, "ONLINE", C.green, u32(C.green, 0.12), true) + gap
+        px = px + UI.pill(dl, px, py, "ONLINE", C.green, u32(C.green, 0.12), true) + gap
         local parts = {}
         if info.level then parts[#parts + 1] = "LVL " .. info.level end
         if info.cred then parts[#parts + 1] = "CRED " .. info.cred end
         if info.money then parts[#parts + 1] = "E$ " .. formatNumber(info.money) end
         for _, text in ipairs(parts) do
-            px = px + pill(dl, px, py, text, C.text, u32(C.panelHi, 0.9)) + gap
+            px = px + UI.pill(dl, px, py, text, C.text, u32(C.panelHi, 0.9)) + gap
         end
         local active = activeCheatCount()
-        pill(dl, px, py, active .. (active == 1 and " CHEAT ON" or " CHEATS ON"), C.black, u32(C.yellow, 0.95))
+        UI.pill(dl, px, py, active .. (active == 1 and " CHEAT ON" or " CHEATS ON"), C.black, u32(C.yellow, 0.95))
     else
-        px = px + pill(dl, px, py, "NO SAVE LOADED", C.red, u32(C.red, 0.14), true) + gap
+        px = px + UI.pill(dl, px, py, "NO SAVE LOADED", C.red, u32(C.red, 0.14), true) + gap
         ImGui.SetCursorScreenPos(px, py + em(0.22))
         textColored(C.dim, "load a save to enable the cheats")
     end
@@ -3666,7 +3670,7 @@ local function drawFancyHeader()
     ImGui.Dummy(0, 0)
 end
 
-local function drawPlainHeader()
+function UI.drawPlainHeader()
     textColored(C.yellow, "NIGHT CITY TRAINER")
     ImGui.SameLine()
     textColored(C.dim, "v" .. NCT.version)
@@ -3690,11 +3694,11 @@ local function drawPlainHeader()
     ImGui.Separator()
 end
 
-local function drawHeader()
-    if not (canDraw() and pcall(drawFancyHeader)) then drawPlainHeader() end
+function UI.drawHeader()
+    if not (canDraw() and pcall(UI.drawFancyHeader)) then UI.drawPlainHeader() end
 end
 
-local function openPage(name)
+function UI.openPage(name)
     if NCT.page ~= name then
         NCT.page = name
         anim.pageAt = os.clock()
@@ -3702,7 +3706,7 @@ local function openPage(name)
 end
 
 -- Sidebar with a highlight that glides to the selected page.
-local function drawFancySidebar()
+function UI.drawFancySidebar()
     local dl = ImGui.GetWindowDrawList()
     local w = availWidth()
     local h = em(1.95)
@@ -3722,7 +3726,7 @@ local function drawFancySidebar()
     for i, page in ipairs(PAGES) do
         local iy = y0 + (i - 1) * step
         ImGui.SetCursorScreenPos(x0, iy)
-        if ImGui.InvisibleButton("##nav" .. i, w, h) then openPage(page[1]) end
+        if ImGui.InvisibleButton("##nav" .. i, w, h) then UI.openPage(page[1]) end
         local hovered = ImGui.IsItemHovered()
         if hovered and i ~= selected then
             fillRect(dl, x0, iy, x0 + w, iy + h, u32(C.panelHi, 0.55), 5)
@@ -3737,7 +3741,7 @@ local function drawFancySidebar()
     end
 end
 
-local function drawPlainSidebar()
+function UI.drawPlainSidebar()
     local w = availWidth()
     -- Left-aligned labels so the icons line up.
     ImGui.PushStyleVar(ImGuiStyleVar.ButtonTextAlign, 0.08, 0.5)
@@ -3747,7 +3751,7 @@ local function drawPlainSidebar()
         if NCT.page == name then
             primaryButton(label, w)
         elseif button(label, w) then
-            openPage(name)
+            UI.openPage(name)
         end
     end
     ImGui.Dummy(0, em(0.3))
@@ -3757,12 +3761,12 @@ local function drawPlainSidebar()
     ImGui.PopStyleVar(1)
 end
 
-local function drawSidebar()
-    if not (canDraw() and pcall(drawFancySidebar)) then drawPlainSidebar() end
+function UI.drawSidebar()
+    if not (canDraw() and pcall(UI.drawFancySidebar)) then UI.drawPlainSidebar() end
 end
 
 -- Status line at the bottom: the latest message, fading in when it changes.
-local function drawStatusBar()
+function UI.drawStatusBar()
     local ok = NCT.toast.ok
     local color = ok and C.green or C.red
     local t = easeOut((os.clock() - NCT.toast.time) / 0.35)
@@ -3783,7 +3787,7 @@ local function drawStatusBar()
     if not fancy then wrapped(color, "> " .. NCT.toast.text) end
 end
 
-local function drawWindow()
+function UI.drawWindow()
     ImGui.SetNextWindowSize(em(48), em(44), ImGuiCond.FirstUseEver)
     ImGui.SetNextWindowPos(80, 80, ImGuiCond.FirstUseEver)
 
@@ -3803,13 +3807,13 @@ local function drawWindow()
                 gradientRect(ImGui.GetWindowDrawList(), wx + 8, wy, wx + ww - 8, wy + 2, u32(C.yellow), u32(C.cyan, 0.8))
             end)
         end
-        drawHeader()
+        UI.drawHeader()
 
         local _, availH = ImGui.GetContentRegionAvail()
         local bodyH = math.max(availH - em(2.6), em(6))
 
         ImGui.BeginChild("##nct_side", em(11), bodyH, true)
-        drawSidebar()
+        UI.drawSidebar()
         ImGui.EndChild()
 
         ImGui.SameLine()
@@ -3838,14 +3842,14 @@ local function drawWindow()
         ImGui.EndChild()
         ImGui.PopStyleColor(1)
 
-        drawStatusBar()
+        UI.drawStatusBar()
     end
     ImGui.End()
 end
 
 -- Small message at the top of the screen, shown while the menu is closed so
 -- hotkeys still give feedback.
-local function drawPopup()
+function UI.drawPopup()
     local width = GetDisplayResolution()
     local age = os.clock() - NCT.toast.time
     local appear = easeOut(age / 0.25)
@@ -3961,7 +3965,7 @@ registerForEvent("onUpdate", function(delta)
     end
 
     pcall(stepShopBuild)
-    pcall(stepBulk)
+    pcall(UI.stepBulk)
     pcall(stepJob)
 
     if NCT.saveTick >= 5 then
@@ -4032,7 +4036,7 @@ registerForEvent("onDraw", function()
     if not NCT.overlayOpen and not showPopup then return end
 
     pushTheme()
-    local ok, err = pcall(NCT.overlayOpen and drawWindow or drawPopup)
+    local ok, err = pcall(NCT.overlayOpen and UI.drawWindow or UI.drawPopup)
     popTheme()
     if not ok then
         print("[NightCityTrainer] draw error: " .. tostring(err))
@@ -4094,7 +4098,7 @@ registerHotkey("nct_skip_hour", "Skip one hour", function()
 end)
 
 registerHotkey("nct_flip_vehicle", "Flip vehicle upright", function()
-    run("Vehicle flipped upright", flipVehicle)
+    run("Vehicle flipped upright", UI.flipVehicle)
 end)
 
 registerHotkey("nct_kill_enemies", "Kill hostile enemies nearby", function()
